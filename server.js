@@ -1,3 +1,5 @@
+const fs = require('fs')
+const path = require('path')
 const express = require('express')
 const cors = require('cors')
 
@@ -6,6 +8,8 @@ const PORT = Number(process.env.PORT || 10000)
 const HOSPITAL_SITES = ['Wythenshawe Hospital', 'Trafford Hospital']
 const SHIFT_TYPES = ['DAYTIME', 'LONG_DAY', 'NIGHT']
 const GRADE_CYCLE = ['FY1', 'FY2', 'SHO', 'Registrar', 'Consultant', 'ST1', 'ST2', 'ST3', 'ST4', 'ST5']
+const DATA_DIRECTORY = path.join(__dirname, 'data')
+const STORE_PATH = path.join(DATA_DIRECTORY, 'medrota-store.json')
 
 app.use(express.json({ limit: '10mb' }))
 app.use(
@@ -80,14 +84,65 @@ function buildDoctorSeed() {
   return { doctors, contracts }
 }
 
-const seed = buildDoctorSeed()
+function createDefaultState() {
+  const seed = buildDoctorSeed()
+  return {
+    doctors: seed.doctors,
+    contracts: seed.contracts,
+    schedules: new Map(),
+    scheduleOrder: [],
+    generatedScheduleCount: 0,
+  }
+}
 
-const state = {
-  doctors: seed.doctors,
-  contracts: seed.contracts,
-  schedules: new Map(),
-  scheduleOrder: [],
-  generatedScheduleCount: 0,
+function ensureDataDirectory() {
+  if (!fs.existsSync(DATA_DIRECTORY)) {
+    fs.mkdirSync(DATA_DIRECTORY, { recursive: true })
+  }
+}
+
+function loadState() {
+  if (!fs.existsSync(STORE_PATH)) {
+    return createDefaultState()
+  }
+
+  try {
+    const raw = fs.readFileSync(STORE_PATH, 'utf8')
+    const parsed = JSON.parse(raw)
+
+    return {
+      doctors: Array.isArray(parsed.doctors) ? parsed.doctors : [],
+      contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
+      schedules: new Map(Array.isArray(parsed.schedules) ? parsed.schedules : []),
+      scheduleOrder: Array.isArray(parsed.scheduleOrder) ? parsed.scheduleOrder : [],
+      generatedScheduleCount: Number(parsed.generatedScheduleCount) || 0,
+    }
+  } catch (error) {
+    console.error(`Unable to load persisted store at ${STORE_PATH}: ${error.message}`)
+    return createDefaultState()
+  }
+}
+
+function saveState() {
+  ensureDataDirectory()
+
+  const serializable = {
+    doctors: state.doctors,
+    contracts: state.contracts,
+    schedules: Array.from(state.schedules.entries()),
+    scheduleOrder: state.scheduleOrder,
+    generatedScheduleCount: state.generatedScheduleCount,
+  }
+
+  const temporaryPath = `${STORE_PATH}.tmp`
+  fs.writeFileSync(temporaryPath, JSON.stringify(serializable, null, 2), 'utf8')
+  fs.renameSync(temporaryPath, STORE_PATH)
+}
+
+const state = loadState()
+
+function hasPersistedState() {
+  return fs.existsSync(STORE_PATH)
 }
 
 function doctorsForSchedule(selectedSites) {
@@ -351,15 +406,24 @@ function saveSchedule(schedule) {
 }
 
 function initializeSchedules() {
-  const baseline = createSchedule({
-    year: 2026,
-    selectedSites: HOSPITAL_SITES,
-    fixedId: 'demo-schedule-2026',
-    generatedAt: '2026-03-21T21:00:00.000Z',
-  })
+  if (state.schedules.size === 0) {
+    const baseline = createSchedule({
+      year: 2026,
+      selectedSites: HOSPITAL_SITES,
+      fixedId: 'demo-schedule-2026',
+      generatedAt: '2026-03-21T21:00:00.000Z',
+    })
 
-  saveSchedule(baseline)
-  state.generatedScheduleCount = 12
+    saveSchedule(baseline)
+    state.generatedScheduleCount = 12
+    saveState()
+    return
+  }
+
+  if (state.scheduleOrder.length === 0) {
+    state.scheduleOrder = Array.from(state.schedules.keys()).reverse()
+    saveState()
+  }
 }
 
 initializeSchedules()
@@ -390,6 +454,7 @@ app.get('/health', (request, response) => {
     service: 'med-rota-backend',
     doctors: state.doctors.length,
     schedules: state.generatedScheduleCount,
+    persistence: hasPersistedState() ? 'disk' : 'seeded-memory',
   })
 })
 
@@ -429,6 +494,7 @@ app.post('/api/v1/doctors/', (request, response) => {
   }
 
   state.doctors.push(doctor)
+  saveState()
   response.status(201).json(doctor)
 })
 
@@ -512,6 +578,7 @@ app.post('/api/v1/doctors/batch-import', (request, response) => {
     })
   })
 
+  saveState()
   response.json({
     status: errors.length > 0 ? 'partial' : 'success',
     imported: importedDoctors.length,
@@ -556,6 +623,7 @@ app.post('/api/v1/doctors/:doctorId/contracts', (request, response) => {
   }
 
   state.contracts.push(contract)
+  saveState()
   response.status(201).json(contract)
 })
 
@@ -591,6 +659,7 @@ app.post('/api/v1/schedule/generate', (request, response) => {
     const schedule = createSchedule({ year, selectedSites })
     saveSchedule(schedule)
     state.generatedScheduleCount += 1
+    saveState()
 
     response.json({
       status: 'complete',
