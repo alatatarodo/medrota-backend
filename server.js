@@ -1,5 +1,12 @@
-console.error('This backend now runs from FastAPI, not the legacy Express mock server.')
-console.error('Start it from the backend directory with one of these commands:')
-console.error('  python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000')
-console.error('  py -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000')
-process.exit(1)
+const express = require("express");
+const app = express();
+
+const PORT = process.env.PORT || 10000;
+
+app.get("/", (req, res) => {
+  res.json({ message: "MedRota API running" });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
