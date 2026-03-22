@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: medrota-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://frontend-cyan-beta-65.vercel.app
+      - key: API_TITLE
+        value: Medical Rostering Automation API
+      - key: API_VERSION
+        value: 1.0.0
+      - key: SCHEDULER_TIMEOUT_SECONDS
+        value: 300
+      - key: SCHEDULER_MAX_ITERATIONS
+        value: 1000
+      - key: FAIRNESS_NIGHT_TOLERANCE
+        value: 2
+      - key: FAIRNESS_WEEKEND_TOLERANCE
+        value: 1
+      - key: FAIRNESS_ONCALL_TOLERANCE
+        value: 1
+      - key: FAIRNESS_SCORE_TARGET
+        value: 85.0
+      - key: REDIS_URL
+        sync: false

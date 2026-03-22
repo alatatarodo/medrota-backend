@@ -1,5 +1,8 @@
-from pydantic_settings import BaseSettings
+import json
 from typing import Optional
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -12,7 +15,7 @@ class Settings(BaseSettings):
     api_description: str = "Automated rostering system for NHS doctors"
     
     # CORS
-    allowed_origins: list = ["http://localhost:3000", "http://localhost:5173"]
+    allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
     
     # Scheduler
     scheduler_timeout_seconds: int = 300
@@ -26,6 +29,21 @@ class Settings(BaseSettings):
     
     # Redis (for async jobs)
     redis_url: str = "redis://localhost:6379/0"
+
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def parse_allowed_origins(cls, value):
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return []
+
+            if trimmed.startswith("["):
+                return json.loads(trimmed)
+
+            return [origin.strip() for origin in trimmed.split(",") if origin.strip()]
+
+        return value
     
     class Config:
         env_file = ".env"
