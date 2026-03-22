@@ -1,12 +1,18 @@
 import json
 
-from pydantic import field_validator
+from pydantic import ValidationInfo, field_validator
 from pydantic_settings import BaseSettings
+
+
+def build_default_sqlite_url(data_dir: str) -> str:
+    normalized = (data_dir or "./data").rstrip("/\\")
+    return f"sqlite:///{normalized}/medrota.db"
 
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = "sqlite:///./data/medrota.db"
+    data_dir: str = "./data"
+    database_url: str = build_default_sqlite_url("./data")
     
     # API
     api_title: str = "Medical Rostering Automation API"
@@ -46,14 +52,16 @@ class Settings(BaseSettings):
 
     @field_validator("database_url", mode="before")
     @classmethod
-    def parse_database_url(cls, value):
+    def parse_database_url(cls, value, info: ValidationInfo):
+        data_dir = (info.data or {}).get("data_dir", "./data")
+
         if value is None:
-            return "sqlite:///./data/medrota.db"
+            return build_default_sqlite_url(data_dir)
 
         if isinstance(value, str):
             trimmed = value.strip()
             if not trimmed:
-                return "sqlite:///./data/medrota.db"
+                return build_default_sqlite_url(data_dir)
 
             if trimmed.startswith("postgres://"):
                 return f"postgresql://{trimmed[len('postgres://'):]}"

@@ -8,7 +8,7 @@ const PORT = Number(process.env.PORT || 10000)
 const HOSPITAL_SITES = ['Wythenshawe Hospital', 'Trafford Hospital']
 const SHIFT_TYPES = ['DAYTIME', 'LONG_DAY', 'NIGHT']
 const GRADE_CYCLE = ['FY1', 'FY2', 'SHO', 'Registrar', 'Consultant', 'ST1', 'ST2', 'ST3', 'ST4', 'ST5']
-const DATA_DIRECTORY = path.join(__dirname, 'data')
+const DATA_DIRECTORY = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'))
 const STORE_PATH = path.join(DATA_DIRECTORY, 'medrota-store.json')
 
 app.use(express.json({ limit: '10mb' }))

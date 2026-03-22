@@ -70,6 +70,7 @@ Options:
 Environment:
   RENDER_API_KEY              Required Render API key.
   DATABASE_URL                Optional. If omitted, the FastAPI service falls back to SQLite.
+  DATA_DIR                    Optional. Persistent data directory for SQLite or the Node compatibility layer.
 `)
 }
 
@@ -177,6 +178,10 @@ async function main() {
     await upsertEnvVar(options.serviceId, 'DATABASE_URL', process.env.DATABASE_URL, token)
   } else {
     console.log('DATABASE_URL not provided. FastAPI will use the SQLite fallback at ./data/medrota.db.')
+  }
+
+  if (process.env.DATA_DIR) {
+    await upsertEnvVar(options.serviceId, 'DATA_DIR', process.env.DATA_DIR, token)
   }
 
   const deploy = await renderRequest(`/services/${options.serviceId}/deploys`, {

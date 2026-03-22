@@ -31,3 +31,19 @@ RENDER_API_KEY=your_render_api_key DATABASE_URL=your_postgres_url node scripts/r
 ```
 
 If `DATABASE_URL` is omitted, the FastAPI backend now falls back to SQLite at `./data/medrota.db` and seeds the baseline 1,600-doctor Wythenshawe/Trafford dataset on first boot.
+
+### Optional persistent data directory
+
+If you later attach a Render disk, you can point both the Node compatibility layer and the FastAPI SQLite fallback at that mount path:
+
+```bash
+RENDER_API_KEY=your_render_api_key DATA_DIR=/var/data node scripts/render-cutover.mjs
+```
+
+### Live verification
+
+After any deployment, you can verify the live frontend/backend pair with:
+
+```bash
+npm run verify:live
+```
