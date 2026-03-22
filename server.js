@@ -1,0 +1,5 @@
+console.error('This backend now runs from FastAPI, not the legacy Express mock server.')
+console.error('Start it from the backend directory with one of these commands:')
+console.error('  python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000')
+console.error('  py -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000')
+process.exit(1)
