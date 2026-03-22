@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from app.core.config import settings
-from app.db.database import Base, engine
+from app.db.database import Base, SessionLocal, engine
+from app.bootstrap import seed_sample_data
 from app.api import doctors, schedule
 
 # Create tables
@@ -11,17 +12,24 @@ Base.metadata.create_all(bind=engine)
 
 def ensure_schema_updates():
     """Apply lightweight schema updates for environments without migrations."""
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "ALTER TABLE doctors "
-                "ADD COLUMN IF NOT EXISTS hospital_site VARCHAR(100) "
-                "NOT NULL DEFAULT 'Wythenshawe Hospital'"
+    inspector = inspect(engine)
+    doctor_columns = {column["name"] for column in inspector.get_columns("doctors")}
+
+    if "hospital_site" not in doctor_columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE doctors "
+                    "ADD COLUMN hospital_site VARCHAR(100) "
+                    "NOT NULL DEFAULT 'Wythenshawe Hospital'"
+                )
             )
-        )
 
 
 ensure_schema_updates()
+
+with SessionLocal() as bootstrap_session:
+    seed_sample_data(bootstrap_session)
 
 # Create FastAPI app
 app = FastAPI(

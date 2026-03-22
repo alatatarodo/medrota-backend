@@ -1,5 +1,4 @@
 import json
-from typing import Optional
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
@@ -7,7 +6,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = "postgresql://postgres:password@localhost:5432/med_rota"
+    database_url: str = "sqlite:///./data/medrota.db"
     
     # API
     api_title: str = "Medical Rostering Automation API"
@@ -42,6 +41,24 @@ class Settings(BaseSettings):
                 return json.loads(trimmed)
 
             return [origin.strip() for origin in trimmed.split(",") if origin.strip()]
+
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def parse_database_url(cls, value):
+        if value is None:
+            return "sqlite:///./data/medrota.db"
+
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return "sqlite:///./data/medrota.db"
+
+            if trimmed.startswith("postgres://"):
+                return f"postgresql://{trimmed[len('postgres://'):]}"
+
+            return trimmed
 
         return value
     
