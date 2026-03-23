@@ -897,6 +897,44 @@ def approve_locum_request(request_id: str, body: dict | None = None, db: Session
     return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.APPROVED.value}
 
 
+@router.post("/locum-requests/{request_id}/reject")
+def reject_locum_request(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
+    if approval_status == LocumApprovalStatus.FILLED.value:
+        raise HTTPException(status_code=400, detail="Filled requests cannot be rejected")
+
+    reason = str((body or {}).get("reason", "")).strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A rejection reason is required")
+
+    approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
+    locum_request.approval_status = LocumApprovalStatus.DECLINED
+    locum_request.approved_by = approved_by
+    locum_request.approved_at = datetime.utcnow()
+    locum_request.approval_comment = reason
+    existing_notes = locum_request.notes or ""
+    locum_request.notes = f"{existing_notes}\nRejected: {reason}".strip()
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="REJECTED",
+        hospital_site=locum_request.hospital_site,
+        actor_name=approved_by,
+        summary=f"Locum request rejected for {locum_request.ward}",
+        detail=reason,
+    )
+    db.commit()
+
+    shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
+    shift_pattern = _build_shift_pattern(shift) if shift else {}
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern} if shift else {})
+
+
 @router.post("/availability-events/{event_id}/cancel")
 def cancel_availability_event(event_id: str, body: dict | None = None, db: Session = Depends(get_db)):
     event = db.query(DoctorAvailabilityEvent).filter(DoctorAvailabilityEvent.id == event_id).first()
@@ -917,6 +955,39 @@ def cancel_availability_event(event_id: str, body: dict | None = None, db: Sessi
         actor_name="Operations Workspace",
         summary=f"Availability event cancelled for doctor {event.doctor_id}",
         detail=notes,
+    )
+    db.commit()
+
+    doctors = db.query(Doctor).filter(Doctor.id.in_([doctor_id for doctor_id in [event.doctor_id, event.related_doctor_id] if doctor_id])).all()
+    return _serialize_event(event, {doctor.id: doctor for doctor in doctors})
+
+
+@router.post("/availability-events/{event_id}/reject")
+def reject_availability_event(event_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    event = db.query(DoctorAvailabilityEvent).filter(DoctorAvailabilityEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Availability event not found")
+
+    reason = str((body or {}).get("reason", "")).strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A rejection reason is required")
+
+    approved_by = (body or {}).get("approved_by", "Rota Coordinator")
+    event.status = "REJECTED"
+    event.approved_by = approved_by
+    event.approved_at = datetime.utcnow()
+    event.approval_comment = reason
+    existing_notes = event.notes or ""
+    event.notes = f"{existing_notes}\nRejected: {reason}".strip()
+    _record_audit_event(
+        db,
+        entity_type="availability_event",
+        entity_id=event.id,
+        action="REJECTED",
+        hospital_site=event.hospital_site,
+        actor_name=approved_by,
+        summary=f"Availability event rejected for doctor {event.doctor_id}",
+        detail=reason,
     )
     db.commit()
 
