@@ -211,7 +211,7 @@ def _build_coverage_pressure(events: list[DoctorAvailabilityEvent], locum_reques
     today = date.today()
 
     for event in events:
-        if event.end_date < today:
+        if event.end_date < today or str(event.status).upper() == "CANCELLED":
             continue
         site_summary = pressure_by_site[event.hospital_site]
         site_summary["active_absences"] += 1
@@ -223,6 +223,9 @@ def _build_coverage_pressure(events: list[DoctorAvailabilityEvent], locum_reques
             site_summary["sickness_events"] += 1
 
     for request in locum_requests:
+        approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
+        if approval_status == LocumApprovalStatus.DECLINED.value:
+            continue
         site_summary = pressure_by_site[request.hospital_site]
         if request.approval_status in (LocumApprovalStatus.PENDING_APPROVAL, LocumApprovalStatus.APPROVED):
             site_summary["pending_locums"] += 1
@@ -267,6 +270,9 @@ def _build_board_entries(
 
     entries = []
     for request in locum_requests:
+        approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
+        if approval_status == LocumApprovalStatus.DECLINED.value:
+            continue
         if request.requested_date < today or request.requested_date > window_end:
             continue
         shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
@@ -307,6 +313,8 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
     risk_register = []
     for request in locum_requests:
         approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
+        if approval_status == LocumApprovalStatus.DECLINED.value:
+            continue
         if approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
             approval_queue.append({
                 "id": request.id,
@@ -375,6 +383,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
 
     coverage_pressure = _build_coverage_pressure(events, locum_requests)
     active_absences = [event for event in events if event.end_date >= date.today()]
+    active_absences = [event for event in active_absences if str(event.status).upper() != "CANCELLED"]
     pending_shift_swaps = [
         event for event in active_absences
         if event.event_type == AvailabilityEventType.SHIFT_SWAP and str(event.status).upper() == "PENDING"
@@ -432,6 +441,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
             ],
             "compliance_levels": [level.value for level in ComplianceLevel],
             "staff_types": ["BANK", "INTERNAL", "AGENCY"],
+            "availability_statuses": ["APPROVED", "PENDING", "RECORDED", "CANCELLED"],
         },
     }
 
@@ -531,6 +541,45 @@ def approve_locum_request(request_id: str, body: dict | None = None, db: Session
     db.commit()
 
     return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.APPROVED.value}
+
+
+@router.post("/availability-events/{event_id}/cancel")
+def cancel_availability_event(event_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    event = db.query(DoctorAvailabilityEvent).filter(DoctorAvailabilityEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Availability event not found")
+
+    event.status = "CANCELLED"
+    notes = (body or {}).get("reason")
+    if notes:
+        existing_notes = event.notes or ""
+        event.notes = f"{existing_notes}\nCancelled: {notes}".strip()
+    db.commit()
+
+    doctors = db.query(Doctor).filter(Doctor.id.in_([doctor_id for doctor_id in [event.doctor_id, event.related_doctor_id] if doctor_id])).all()
+    return _serialize_event(event, {doctor.id: doctor for doctor in doctors})
+
+
+@router.post("/locum-requests/{request_id}/cancel")
+def cancel_locum_request(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
+    if approval_status == LocumApprovalStatus.FILLED.value:
+        raise HTTPException(status_code=400, detail="Filled requests must be manually reviewed before cancellation")
+
+    locum_request.approval_status = LocumApprovalStatus.DECLINED
+    reason = (body or {}).get("reason")
+    if reason:
+        existing_notes = locum_request.notes or ""
+        locum_request.notes = f"{existing_notes}\nCancelled: {reason}".strip()
+    db.commit()
+
+    shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
+    shift_pattern = _build_shift_pattern(shift) if shift else {}
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern} if shift else {})
 
 
 @router.post("/locum-requests/{request_id}/book")
