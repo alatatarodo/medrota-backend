@@ -367,11 +367,14 @@ def _build_board_entries(
         if request.requested_date < today or request.requested_date > window_end:
             continue
         shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
+        governance = _build_locum_governance(request, shift_pattern)
         entries.append({
+            "request_id": request.id,
             "date": request.requested_date.isoformat(),
             "hospital_site": request.hospital_site,
             "ward": request.ward,
             "department": request.department,
+            "shift_code": shift_pattern.get("code"),
             "shift_name": shift_pattern.get("name", "Unmapped shift"),
             "shift_window": shift_pattern.get("shift_window", "TBC"),
             "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
@@ -381,7 +384,10 @@ def _build_board_entries(
             "approval_required": request.approval_required,
             "booked_doctor_name": request.booked_doctor_name,
             "estimated_cost": request.estimated_cost,
+            "requested_hours": request.requested_hours,
+            "staff_type": request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type),
             "shortage_reason": request.shortage_reason,
+            **governance,
         })
 
     return sorted(entries, key=lambda item: (item["date"], item["hospital_site"], item["shift_name"]))
