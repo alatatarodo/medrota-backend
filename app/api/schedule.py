@@ -3,9 +3,10 @@ import csv
 from fastapi import APIRouter, Depends, status, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
-from datetime import date
+from datetime import date, datetime
 from io import StringIO
 import json
+import uuid
 from app.db.database import get_db
 from app.db.models import GeneratedSchedule, ScheduleAssignment, ComplianceViolation, FairnessMetric, Doctor
 from app.core.schemas import ScheduleGenerationRequest, ScheduleGenerationStatus, ComplianceReportDetail, ScheduleAssignmentResponse
@@ -118,6 +119,67 @@ def _build_assignment_query(
         query = query.filter(ScheduleAssignment.assignment_date <= date_to)
 
     return query
+
+
+def _build_schedule_bundle(schedule: GeneratedSchedule, db: Session) -> dict:
+    assignments = db.query(ScheduleAssignment).filter(
+        ScheduleAssignment.schedule_id == schedule.id
+    ).order_by(ScheduleAssignment.assignment_date).all()
+    violations = db.query(ComplianceViolation).filter(
+        ComplianceViolation.schedule_id == schedule.id
+    ).all()
+    fairness_metrics = db.query(FairnessMetric).filter(
+        FairnessMetric.schedule_id == schedule.id
+    ).all()
+
+    return {
+        "schedule": {
+            "id": schedule.id,
+            "schedule_year": schedule.schedule_year,
+            "generated_at": schedule.generated_at.isoformat() if schedule.generated_at else None,
+            "algorithm_version": schedule.algorithm_version,
+            "total_doctors": schedule.total_doctors,
+            "generated_successfully": schedule.generated_successfully,
+            "compliance_score": schedule.compliance_score,
+            "fairness_score": schedule.fairness_score,
+            "exception_count": schedule.exception_count,
+            "notes": schedule.notes,
+        },
+        "assignments": [
+            {
+                "id": assignment.id,
+                "doctor_id": assignment.doctor_id,
+                "assignment_date": assignment.assignment_date.isoformat(),
+                "shift_type_id": assignment.shift_type_id,
+                "status": assignment.status.value if hasattr(assignment.status, "value") else str(assignment.status),
+                "notes": assignment.notes,
+            }
+            for assignment in assignments
+        ],
+        "violations": [
+            {
+                "id": violation.id,
+                "doctor_id": violation.doctor_id,
+                "violation_type": violation.violation_type,
+                "severity": violation.severity,
+                "description": violation.description,
+                "suggested_fix": violation.suggested_fix,
+            }
+            for violation in violations
+        ],
+        "fairness_metrics": [
+            {
+                "id": metric.id,
+                "doctor_id": metric.doctor_id,
+                "metric_type": metric.metric_type,
+                "assigned_count": metric.assigned_count,
+                "target_count": metric.target_count,
+                "variance": metric.variance,
+                "within_acceptable_range": metric.within_acceptable_range,
+            }
+            for metric in fairness_metrics
+        ],
+    }
 
 
 @router.get("/dashboard-summary", response_model=dict)
@@ -450,6 +512,112 @@ def export_assignments(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+
+@router.get("/{schedule_id}/export-bundle")
+def export_schedule_bundle(schedule_id: str, db: Session = Depends(get_db)):
+    """Export the full schedule bundle as JSON for backup/restore."""
+
+    schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    filename = f"schedule-{schedule_id}-bundle.json"
+    return Response(
+        content=json.dumps(_build_schedule_bundle(schedule, db), indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@router.post("/import-bundle", status_code=status.HTTP_201_CREATED)
+def import_schedule_bundle(bundle: dict, db: Session = Depends(get_db)):
+    """Import a previously exported schedule bundle as a new schedule record."""
+
+    schedule_payload = bundle.get("schedule")
+    assignments_payload = bundle.get("assignments", [])
+    violations_payload = bundle.get("violations", [])
+    fairness_payload = bundle.get("fairness_metrics", [])
+
+    if not schedule_payload:
+        raise HTTPException(status_code=400, detail="Bundle must include a schedule payload")
+
+    referenced_doctor_ids = {
+        *[item.get("doctor_id") for item in assignments_payload if item.get("doctor_id")],
+        *[item.get("doctor_id") for item in violations_payload if item.get("doctor_id")],
+        *[item.get("doctor_id") for item in fairness_payload if item.get("doctor_id")],
+    }
+
+    if referenced_doctor_ids:
+        existing_doctor_ids = {
+            doctor.id for doctor in db.query(Doctor).filter(Doctor.id.in_(referenced_doctor_ids)).all()
+        }
+        missing_doctor_ids = sorted(referenced_doctor_ids - existing_doctor_ids)
+        if missing_doctor_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bundle references doctors not present in this environment: {', '.join(missing_doctor_ids[:10])}"
+            )
+
+    new_schedule_id = str(uuid.uuid4())
+    imported_schedule = GeneratedSchedule(
+        id=new_schedule_id,
+        schedule_year=schedule_payload.get("schedule_year"),
+        generated_at=datetime.fromisoformat(schedule_payload["generated_at"]) if schedule_payload.get("generated_at") else datetime.utcnow(),
+        algorithm_version=schedule_payload.get("algorithm_version"),
+        total_doctors=schedule_payload.get("total_doctors"),
+        generated_successfully=schedule_payload.get("generated_successfully"),
+        compliance_score=schedule_payload.get("compliance_score"),
+        fairness_score=schedule_payload.get("fairness_score"),
+        exception_count=schedule_payload.get("exception_count", 0),
+        notes=schedule_payload.get("notes"),
+    )
+    db.add(imported_schedule)
+    db.flush()
+
+    for item in assignments_payload:
+        db.add(ScheduleAssignment(
+            id=str(uuid.uuid4()),
+            schedule_id=new_schedule_id,
+            doctor_id=item["doctor_id"],
+            assignment_date=date.fromisoformat(item["assignment_date"]),
+            shift_type_id=item.get("shift_type_id"),
+            status=item.get("status"),
+            notes=item.get("notes"),
+        ))
+
+    for item in violations_payload:
+        db.add(ComplianceViolation(
+            id=str(uuid.uuid4()),
+            schedule_id=new_schedule_id,
+            doctor_id=item["doctor_id"],
+            violation_type=item["violation_type"],
+            severity=item["severity"],
+            description=item["description"],
+            suggested_fix=item.get("suggested_fix"),
+        ))
+
+    for item in fairness_payload:
+        db.add(FairnessMetric(
+            id=str(uuid.uuid4()),
+            schedule_id=new_schedule_id,
+            doctor_id=item["doctor_id"],
+            metric_type=item["metric_type"],
+            assigned_count=item["assigned_count"],
+            target_count=item["target_count"],
+            variance=item.get("variance"),
+            within_acceptable_range=item.get("within_acceptable_range"),
+        ))
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "schedule_id": new_schedule_id,
+        "imported_assignments": len(assignments_payload),
+        "imported_violations": len(violations_payload),
+        "imported_fairness_metrics": len(fairness_payload),
+    }
 
 
 @router.post("/{schedule_id}/assignments/{assignment_id}/override")
