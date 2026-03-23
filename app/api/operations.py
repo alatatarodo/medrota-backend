@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import json
 import uuid
 
@@ -395,7 +395,12 @@ def _build_board_entries(
     return sorted(entries, key=lambda item: (item["date"], item["hospital_site"], item["shift_name"]))
 
 
-def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns: list[dict]) -> dict:
+def _build_compliance_payload(
+    locum_requests: list[LocumRequest],
+    shift_patterns: list[dict],
+    events: list[DoctorAvailabilityEvent],
+    doctors_by_id: dict[str, Doctor],
+) -> dict:
     shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
     rules = []
     for pattern in shift_patterns:
@@ -410,7 +415,11 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
         })
 
     approval_queue = []
+    shift_swap_queue = []
     risk_register = []
+    approver_workloads = defaultdict(lambda: {"approver": "", "pending_items": 0, "overdue_items": 0, "finance_signoffs": 0})
+    overdue_items = 0
+    finance_signoffs = 0
     for request in locum_requests:
         approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
         if approval_status == LocumApprovalStatus.DECLINED.value:
@@ -418,8 +427,11 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
         shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
         governance = _build_locum_governance(request, shift_pattern)
         if approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
+            age_days = _approval_age_days(request.created_at)
+            aging_status = _approval_aging_status(age_days)
             approval_queue.append({
                 "id": request.id,
+                "queue_type": "LOCUM",
                 "site": request.hospital_site,
                 "ward": request.ward,
                 "requested_date": request.requested_date.isoformat(),
@@ -430,7 +442,15 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
                 "approval_tier": governance["approval_tier"],
                 "spend_cap_status": governance["spend_cap_status"],
                 "requires_finance_signoff": governance["requires_finance_signoff"],
+                "age_days": age_days,
+                "aging_status": aging_status,
             })
+            approver_workloads[governance["recommended_approver"]]["approver"] = governance["recommended_approver"]
+            approver_workloads[governance["recommended_approver"]]["pending_items"] += 1
+            approver_workloads[governance["recommended_approver"]]["overdue_items"] += 1 if aging_status == "OVERDUE" else 0
+            approver_workloads[governance["recommended_approver"]]["finance_signoffs"] += 1 if governance["requires_finance_signoff"] else 0
+            overdue_items += 1 if aging_status == "OVERDUE" else 0
+            finance_signoffs += 1 if governance["requires_finance_signoff"] else 0
 
         if request.compliance_level == ComplianceLevel.CRITICAL or approval_status == LocumApprovalStatus.PENDING_APPROVAL.value or governance["spend_cap_status"] == "OVER_CAP":
             risk_register.append({
@@ -442,9 +462,41 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
                 "recommended_action": f"Route to {governance['recommended_approver']} and secure cover before shift start" if request.approval_required else "Book internal bank cover",
             })
 
+    for event in events:
+        if event.event_type != AvailabilityEventType.SHIFT_SWAP or str(event.status).upper() != "PENDING":
+            continue
+        doctor = doctors_by_id.get(event.doctor_id)
+        related_doctor = doctors_by_id.get(event.related_doctor_id) if event.related_doctor_id else None
+        age_days = _approval_age_days(event.created_at)
+        aging_status = _approval_aging_status(age_days)
+        shift_swap_queue.append({
+            "id": event.id,
+            "queue_type": "SHIFT_SWAP",
+            "site": event.hospital_site,
+            "doctor_name": f"{doctor.first_name} {doctor.last_name}" if doctor else event.doctor_id,
+            "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
+            "shift_date": event.start_date.isoformat(),
+            "session_label": event.session_label,
+            "age_days": age_days,
+            "aging_status": aging_status,
+            "recommended_approver": "Rota Coordinator",
+        })
+        approver_workloads["Rota Coordinator"]["approver"] = "Rota Coordinator"
+        approver_workloads["Rota Coordinator"]["pending_items"] += 1
+        approver_workloads["Rota Coordinator"]["overdue_items"] += 1 if aging_status == "OVERDUE" else 0
+        overdue_items += 1 if aging_status == "OVERDUE" else 0
+
     return {
         "grade_rules": rules,
         "approval_queue": approval_queue,
+        "shift_swap_queue": shift_swap_queue,
+        "approval_overview": {
+            "pending_locum_approvals": len(approval_queue),
+            "pending_shift_swaps": len(shift_swap_queue),
+            "overdue_items": overdue_items,
+            "finance_signoffs": finance_signoffs,
+        },
+        "approver_workloads": sorted(approver_workloads.values(), key=lambda item: (-item["pending_items"], item["approver"])),
         "risk_register": risk_register,
     }
 
@@ -473,6 +525,21 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
         })
 
     return actions[:4]
+
+
+def _approval_age_days(created_at) -> int:
+    if not created_at:
+        return 0
+    created_date = created_at.date() if hasattr(created_at, "date") else created_at
+    return max((date.today() - created_date).days, 0)
+
+
+def _approval_aging_status(age_days: int) -> str:
+    if age_days >= 2:
+        return "OVERDUE"
+    if age_days >= 1:
+        return "DUE_SOON"
+    return "NEW"
 
 
 def _record_audit_event(
@@ -607,7 +674,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
         "leave_events": [_serialize_event(event, doctors_by_id) for event in events],
         "locum_requests": [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests],
         "activity_feed": [_serialize_audit_log(entry) for entry in audit_logs],
-        "compliance": _build_compliance_payload(locum_requests, shift_patterns),
+        "compliance": _build_compliance_payload(locum_requests, shift_patterns, events, doctors_by_id),
         "reference_data": {
             "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
             "doctor_grades": [grade.value for grade in DoctorGrade],
