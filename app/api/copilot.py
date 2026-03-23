@@ -11,7 +11,13 @@ from sqlalchemy.orm import Session
 
 from app.api.operations import build_operations_workspace_payload, _record_audit_event
 from app.core.config import settings
-from app.core.schemas import CopilotQueryRequest, CopilotQueryResponse, CopilotStatusResponse
+from app.core.schemas import (
+    CopilotDraftRequest,
+    CopilotDraftResponse,
+    CopilotQueryRequest,
+    CopilotQueryResponse,
+    CopilotStatusResponse,
+)
 from app.db.database import get_db
 
 router = APIRouter(prefix="/api/v1/copilot", tags=["copilot"])
@@ -40,6 +46,16 @@ ALLOWED_TABS = {
     "upload",
     "schedule",
     "reports",
+}
+
+DRAFT_TITLES = {
+    "locum_request_note": "Locum request note",
+    "finance_justification": "Finance justification",
+    "locum_approval_note": "Locum approval note",
+    "locum_rejection_reason": "Locum rejection reason",
+    "shift_swap_approval_note": "Shift swap approval note",
+    "shift_swap_rejection_reason": "Shift swap rejection reason",
+    "escalation_note": "Escalation note",
 }
 
 
@@ -386,6 +402,102 @@ def _call_openai_copilot(message: str, context_snapshot: dict) -> dict | None:
     return parsed
 
 
+def _build_fallback_draft(draft_type: str, context: dict, hospital_site: str | None) -> tuple[str, str]:
+    site = hospital_site or context.get("hospital_site") or "the site"
+    ward = context.get("ward") or context.get("department") or "the service area"
+    shift_name = context.get("shift_name") or context.get("shift_code") or "the requested shift"
+    required_grade = context.get("required_grade") or "the requested grade"
+    compliance_level = context.get("compliance_level") or "the current compliance level"
+    estimated_cost = context.get("estimated_cost")
+    estimated_cost_text = f"GBP {float(estimated_cost):,.0f}" if estimated_cost not in (None, "") else "the expected shift cost"
+    approval_tier = context.get("approval_tier") or "the required approval tier"
+    finance_required = "requires finance visibility" if context.get("requires_finance_signoff") else "does not currently require finance sign-off"
+    shortage_reason = context.get("shortage_reason") or context.get("reason") or "operational staffing pressure"
+    doctor_name = context.get("doctor_name") or "the doctor"
+    related_doctor_name = context.get("related_doctor_name") or "the paired doctor"
+
+    if draft_type == "locum_request_note":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Cover is requested for {ward} at {site} on {shift_name} because of {shortage_reason}. The shift requires {required_grade} cover at {compliance_level} compliance level and should remain in the approval pathway until a compliant booking is confirmed.",
+        )
+    if draft_type == "finance_justification":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"This request is for {ward} at {site} on {shift_name} with an estimated cost of {estimated_cost_text}. The case sits in {approval_tier} and {finance_required}, so temporary cover is recommended to protect safe ward staffing while the trust manages short-term service pressure.",
+        )
+    if draft_type == "locum_approval_note":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Approved for {ward} at {site} because the {shift_name} gap requires {required_grade} cover and delay would increase operational risk. The request has been reviewed against {compliance_level} compliance controls, current staffing pressure, and the estimated spend of {estimated_cost_text}.",
+        )
+    if draft_type == "locum_rejection_reason":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Not approved at this stage because the request for {ward} at {site} needs stronger justification, an adjusted grade or shift scope, or a compliant alternative before temporary cover is booked. Please review the {compliance_level} requirements, {approval_tier}, and spend position of {estimated_cost_text}.",
+        )
+    if draft_type == "shift_swap_approval_note":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Approved because the proposed swap for {doctor_name} at {site} maintains service cover and does not introduce an obvious compliance conflict in the current rota window. The rota team should still confirm that both doctors remain safe and compliant after the change.",
+        )
+    if draft_type == "shift_swap_rejection_reason":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Not approved because the proposed swap involving {doctor_name} and {related_doctor_name} at {site} needs further review for staffing continuity, doctor availability, or compliance impact before the rota can be amended safely.",
+        )
+    if draft_type == "escalation_note":
+        return (
+            DRAFT_TITLES[draft_type],
+            f"Escalating this item for {site} because the current request is approaching or crossing the expected response window and could affect safe staffing on {ward}. Senior review is recommended now to avoid further delay in a {shift_name} cover decision.",
+        )
+
+    return ("Operational note", "This item has been reviewed in the rota workspace and needs a documented operational decision before the workflow can proceed.")
+
+
+def _call_openai_draft(draft_type: str, context: dict, hospital_site: str | None) -> tuple[str, str] | None:
+    if not settings.openai_api_key.strip():
+        return None
+
+    instructions = (
+        "You are Med Rota AI Copilot drafting short operational notes for an NHS rota team. "
+        "Use only the supplied context. Do not invent facts. "
+        "Return JSON only with keys title and text. "
+        "Keep the note concise, professional, and suitable for an approval log or staffing record."
+    )
+    user_prompt = (
+        f"Draft type: {draft_type}\n"
+        f"Hospital site: {hospital_site}\n"
+        f"Context JSON:\n{json.dumps(context, default=str)}"
+    )
+
+    with httpx.Client(timeout=settings.openai_timeout_seconds) as client:
+        response = client.post(
+            f"{settings.openai_base_url.rstrip('/')}/responses",
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings.openai_model,
+                "instructions": instructions,
+                "input": user_prompt,
+                "max_output_tokens": 300,
+            },
+        )
+        response.raise_for_status()
+
+    parsed = _extract_json_block(_extract_output_text(response.json()))
+    if not isinstance(parsed, dict):
+        return None
+
+    title = str(parsed.get("title") or DRAFT_TITLES.get(draft_type, "Draft note")).strip()
+    text = str(parsed.get("text") or "").strip()
+    if not text:
+        return None
+    return (title, text)
+
+
 def _normalise_copilot_response(raw_response: dict | None, workspace: dict, hospital_site: str | None) -> dict:
     fallback = _build_fallback_response("summary", workspace, hospital_site)
     if not isinstance(raw_response, dict):
@@ -464,3 +576,41 @@ def query_copilot(payload: CopilotQueryRequest, db: Session = Depends(get_db)):
     db.commit()
 
     return response_payload
+
+
+@router.post("/draft", response_model=CopilotDraftResponse)
+def draft_copilot_note(payload: CopilotDraftRequest, db: Session = Depends(get_db)):
+    draft_type = payload.draft_type.strip().lower().replace(" ", "_")
+    title, text = _build_fallback_draft(draft_type, payload.context, payload.hospital_site)
+    mode = "fallback"
+    configured = False
+
+    if _copilot_mode() == "live_ai":
+        try:
+            live_draft = _call_openai_draft(draft_type, payload.context, payload.hospital_site)
+            if live_draft:
+                title, text = live_draft
+                mode = "live_ai"
+                configured = True
+        except Exception:
+            pass
+
+    _record_audit_event(
+        db,
+        entity_type="copilot_draft",
+        entity_id=str(uuid.uuid4()),
+        action="DRAFTED",
+        hospital_site=payload.hospital_site,
+        actor_name="AI Copilot",
+        summary=f"Copilot drafted {draft_type}",
+        detail=title,
+    )
+    db.commit()
+
+    return {
+        "mode": mode,
+        "configured": configured,
+        "draft_type": draft_type,
+        "title": title,
+        "text": text,
+    }

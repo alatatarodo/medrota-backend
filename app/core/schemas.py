@@ -266,3 +266,17 @@ class CopilotQueryResponse(BaseModel):
     risk_level: str
     quick_actions: List[CopilotQuickAction] = Field(default_factory=list)
     follow_up_questions: List[str] = Field(default_factory=list)
+
+
+class CopilotDraftRequest(BaseModel):
+    draft_type: str = Field(min_length=3, max_length=100)
+    hospital_site: Optional[str] = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class CopilotDraftResponse(BaseModel):
+    mode: str
+    configured: bool
+    draft_type: str
+    title: str
+    text: str
