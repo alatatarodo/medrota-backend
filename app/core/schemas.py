@@ -1,7 +1,13 @@
 from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
 from typing import Optional, List
-from app.db.models import DoctorGrade, ConstraintType
+from app.db.models import (
+    AvailabilityEventType,
+    ComplianceLevel,
+    ConstraintType,
+    DoctorGrade,
+    LocumStaffType,
+)
 
 
 # Doctor Schemas
@@ -193,3 +199,31 @@ class ImportResponse(BaseModel):
     status: str
     imported: int
     errors: List[dict]
+
+
+class AvailabilityEventCreate(BaseModel):
+    doctor_id: str
+    event_type: AvailabilityEventType
+    start_date: date
+    end_date: date
+    session_label: str = "ALL_DAY"
+    status: str = "APPROVED"
+    reason_category: Optional[str] = None
+    related_doctor_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LocumRequestCreate(BaseModel):
+    hospital_site: str
+    department: str
+    ward: str
+    requested_date: date
+    shift_code: str
+    required_grade: DoctorGrade
+    compliance_level: ComplianceLevel = ComplianceLevel.STANDARD
+    staff_type: LocumStaffType = LocumStaffType.BANK
+    approval_required: bool = True
+    requested_hours: int = Field(default=8, ge=1, le=24)
+    shortage_reason: str
+    requested_by: str
+    notes: Optional[str] = None

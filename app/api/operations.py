@@ -1,10 +1,12 @@
 from collections import defaultdict
 from datetime import date, timedelta
 import json
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.schemas import AvailabilityEventCreate, LocumRequestCreate
 from app.db.database import get_db
 from app.db.models import (
     AvailabilityEventType,
@@ -58,6 +60,28 @@ EVENT_LABELS = {
     AvailabilityEventType.SHIFT_SWAP: "Shift Swap",
 }
 
+GRADE_RATE_CARD = {
+    "FY1": 38,
+    "FY2": 42,
+    "SHO": 52,
+    "ST1": 44,
+    "ST2": 48,
+    "ST3": 58,
+    "ST4": 62,
+    "ST5": 66,
+    "ST6": 72,
+    "ST7": 78,
+    "ST8": 82,
+    "Registrar": 72,
+    "Consultant": 110,
+}
+
+STAFF_MULTIPLIERS = {
+    "BANK": 1.0,
+    "INTERNAL": 0.92,
+    "AGENCY": 1.25,
+}
+
 
 def _grade_value(grade: str) -> int:
     try:
@@ -78,6 +102,14 @@ def _parse_allowed_grades(raw_value) -> list[str]:
     except (TypeError, json.JSONDecodeError):
         pass
     return [item.strip() for item in str(raw_value).split(",") if item.strip()]
+
+
+def _estimate_locum_cost(required_grade: DoctorGrade, staff_type, requested_hours: int) -> float:
+    grade_key = required_grade.value if hasattr(required_grade, "value") else str(required_grade)
+    staff_key = staff_type.value if hasattr(staff_type, "value") else str(staff_type)
+    base_rate = GRADE_RATE_CARD.get(grade_key, 50)
+    multiplier = STAFF_MULTIPLIERS.get(staff_key, 1.0)
+    return round(base_rate * multiplier * requested_hours, 2)
 
 
 def _build_shift_pattern(shift: ShiftType) -> dict:
@@ -391,7 +423,96 @@ def get_operations_workspace(db: Session = Depends(get_db)):
         "leave_events": [_serialize_event(event, doctors_by_id) for event in events],
         "locum_requests": [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests],
         "compliance": _build_compliance_payload(locum_requests, shift_patterns),
+        "reference_data": {
+            "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
+            "doctor_grades": [grade.value for grade in DoctorGrade],
+            "availability_event_types": [
+                {"value": event_type.value, "label": EVENT_LABELS.get(event_type, event_type.value.replace("_", " ").title())}
+                for event_type in AvailabilityEventType
+            ],
+            "compliance_levels": [level.value for level in ComplianceLevel],
+            "staff_types": ["BANK", "INTERNAL", "AGENCY"],
+        },
     }
+
+
+@router.post("/availability-events", status_code=201)
+def create_availability_event(payload: AvailabilityEventCreate, db: Session = Depends(get_db)):
+    doctor = db.query(Doctor).filter(Doctor.id == payload.doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    if payload.start_date > payload.end_date:
+        raise HTTPException(status_code=400, detail="Start date must be on or before end date")
+
+    related_doctor = None
+    if payload.related_doctor_id:
+        related_doctor = db.query(Doctor).filter(Doctor.id == payload.related_doctor_id).first()
+        if not related_doctor:
+            raise HTTPException(status_code=404, detail="Related doctor not found")
+        if related_doctor.hospital_site != doctor.hospital_site:
+            raise HTTPException(status_code=400, detail="Related doctor must be from the same hospital site")
+
+    if payload.event_type == AvailabilityEventType.SHIFT_SWAP and not payload.related_doctor_id:
+        raise HTTPException(status_code=400, detail="Shift swap requests require a related doctor")
+
+    event = DoctorAvailabilityEvent(
+        id=str(uuid.uuid4()),
+        doctor_id=payload.doctor_id,
+        hospital_site=doctor.hospital_site,
+        event_type=payload.event_type,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        session_label=payload.session_label,
+        status=payload.status,
+        reason_category=payload.reason_category,
+        related_doctor_id=payload.related_doctor_id,
+        notes=payload.notes,
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+
+    doctors_by_id = {item.id: item for item in [doctor] + ([related_doctor] if related_doctor else [])}
+    return _serialize_event(event, doctors_by_id)
+
+
+@router.post("/locum-requests", status_code=201)
+def create_locum_request(payload: LocumRequestCreate, db: Session = Depends(get_db)):
+    shift = db.query(ShiftType).filter(ShiftType.code == payload.shift_code).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift pattern not found")
+
+    approval_status = (
+        LocumApprovalStatus.PENDING_APPROVAL
+        if payload.approval_required
+        else LocumApprovalStatus.APPROVED
+    )
+
+    locum_request = LocumRequest(
+        id=str(uuid.uuid4()),
+        hospital_site=payload.hospital_site,
+        department=payload.department,
+        ward=payload.ward,
+        requested_date=payload.requested_date,
+        shift_type_id=shift.id,
+        required_grade=payload.required_grade,
+        compliance_level=payload.compliance_level,
+        staff_type=payload.staff_type,
+        approval_status=approval_status,
+        approval_required=payload.approval_required,
+        requested_hours=payload.requested_hours,
+        estimated_cost=_estimate_locum_cost(payload.required_grade, payload.staff_type, payload.requested_hours),
+        shortage_reason=payload.shortage_reason,
+        requested_by=payload.requested_by,
+        notes=payload.notes,
+    )
+    db.add(locum_request)
+    db.commit()
+    db.refresh(locum_request)
+
+    shift_pattern = _build_shift_pattern(shift)
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern})
 
 
 @router.post("/locum-requests/{request_id}/approve")

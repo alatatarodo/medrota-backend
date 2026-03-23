@@ -41,6 +41,8 @@ def list_doctors(
     skip: int = 0,
     limit: int = 100,
     hospital_site: str = None,
+    grade: DoctorGrade = None,
+    search: str = None,
     db: Session = Depends(get_db)
 ):
     """List all doctors with pagination"""
@@ -48,6 +50,21 @@ def list_doctors(
 
     if hospital_site:
         query = query.filter(Doctor.hospital_site == hospital_site)
+
+    if grade:
+        query = query.filter(Doctor.grade == grade)
+
+    if search:
+        search_term = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Doctor.id.ilike(search_term),
+                Doctor.gmc_number.ilike(search_term),
+                Doctor.first_name.ilike(search_term),
+                Doctor.last_name.ilike(search_term),
+                Doctor.email.ilike(search_term),
+            )
+        )
 
     doctors = query.offset(skip).limit(limit).all()
     return doctors
