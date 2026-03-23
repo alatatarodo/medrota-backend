@@ -362,6 +362,10 @@ class SchedulingEngine:
         
         except Exception as e:
             schedule.generated_successfully = False
+            schedule.notes = json.dumps({
+                "error": str(e),
+                "hospital_sites": hospital_sites or [],
+            })
             self.db.commit()
             return {
                 "schedule_id": schedule.id,
@@ -389,10 +393,22 @@ class SchedulingEngine:
                 # Create default shift types if none exist
                 self._create_default_shift_types()
                 shift_types = self.db.query(ShiftType).all()
+
+            shift_by_code = {shift.code: shift for shift in shift_types}
+
+            contracts = self.db.query(Contract).filter(
+                Contract.doctor_id.in_([doctor.id for doctor in doctors]),
+                Contract.start_date <= end_date,
+                Contract.end_date >= start_date,
+            ).all()
+            contracts_by_doctor = defaultdict(list)
+            for contract in contracts:
+                contracts_by_doctor[contract.doctor_id].append(contract)
             
             # Site-aware assignment: cover each hospital site independently each day.
             current_date = start_date
             doctors_by_site = defaultdict(list)
+            pending_assignments = []
 
             for doctor in doctors:
                 doctors_by_site[doctor.hospital_site].append(doctor)
@@ -406,21 +422,20 @@ class SchedulingEngine:
 
                     eligible_doctors = [
                         doctor for doctor in site_doctors
-                        if self.db.query(Contract).filter(
-                            Contract.doctor_id == doctor.id,
-                            Contract.start_date <= current_date,
-                            Contract.end_date >= current_date
-                        ).first()
+                        if any(
+                            contract.start_date <= current_date <= contract.end_date
+                            for contract in contracts_by_doctor.get(doctor.id, [])
+                        )
                     ]
 
                     if not eligible_doctors:
                         continue
 
                     doctor = eligible_doctors[site_indices[site_name] % len(eligible_doctors)]
-                    shift = self._select_shift_for_doctor(doctor, shift_types, current_date)
+                    shift = self._select_shift_for_doctor(doctor, shift_by_code, current_date)
 
                     if shift:
-                        assignment = ScheduleAssignment(
+                        pending_assignments.append(ScheduleAssignment(
                             id=str(uuid.uuid4()),
                             schedule_id=schedule_id,
                             doctor_id=doctor.id,
@@ -428,13 +443,15 @@ class SchedulingEngine:
                             shift_type_id=shift.id,
                             status=AssignmentStatus.ASSIGNED,
                             notes=f"Hospital site: {site_name}",
-                        )
-                        self.db.add(assignment)
+                        ))
 
                     site_indices[site_name] += 1
 
                 current_date += timedelta(days=1)
-            
+
+            if pending_assignments:
+                self.db.bulk_save_objects(pending_assignments)
+
             self.db.commit()
             return True
         
@@ -442,26 +459,26 @@ class SchedulingEngine:
             print(f"Scheduling error: {e}")
             return False
     
-    def _select_shift_for_doctor(self, doctor: Doctor, shift_types: List[ShiftType], 
+    def _select_shift_for_doctor(self, doctor: Doctor, shift_types_by_code: Dict[str, ShiftType], 
                                 current_date: date) -> Optional[ShiftType]:
         """Select appropriate shift type for doctor"""
         
         # FY1: daytime only
         if doctor.grade == DoctorGrade.FY1:
-            return next((s for s in shift_types if s.code == "DAYTIME"), None)
+            return shift_types_by_code.get("DAYTIME")
         
         # Rotate shift types for other grades
         day_of_week = current_date.weekday()
         
         # Weekends get different distribution
         if day_of_week >= 4:  # Weekend
-            return next((s for s in shift_types if s.code in ["DAYTIME", "NIGHT"]), None)
+            return shift_types_by_code.get("DAYTIME") or shift_types_by_code.get("NIGHT")
         
         # Weekdays
         if day_of_week % 3 == 0:
-            return next((s for s in shift_types if s.code == "NIGHT"), None)
+            return shift_types_by_code.get("NIGHT")
         else:
-            return next((s for s in shift_types if s.code == "DAYTIME"), None)
+            return shift_types_by_code.get("DAYTIME")
     
     def _create_default_shift_types(self):
         """Create default shift types if none exist"""
