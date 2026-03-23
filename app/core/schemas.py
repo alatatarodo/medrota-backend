@@ -213,6 +213,10 @@ class AvailabilityEventCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class AvailabilityEventUpdate(AvailabilityEventCreate):
+    pass
+
+
 class LocumRequestCreate(BaseModel):
     hospital_site: str
     department: str
@@ -227,3 +231,7 @@ class LocumRequestCreate(BaseModel):
     shortage_reason: str
     requested_by: str
     notes: Optional[str] = None
+
+
+class LocumRequestUpdate(LocumRequestCreate):
+    pass

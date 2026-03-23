@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.schemas import AvailabilityEventCreate, LocumRequestCreate
+from app.core.schemas import AvailabilityEventCreate, AvailabilityEventUpdate, LocumRequestCreate, LocumRequestUpdate
 from app.db.database import get_db
 from app.db.models import (
     AvailabilityEventType,
@@ -245,6 +245,7 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
         "session_label": event.session_label,
         "status": event.status,
         "reason_category": event.reason_category,
+        "related_doctor_id": event.related_doctor_id,
         "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
         "notes": event.notes,
     }
@@ -473,6 +474,35 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
     return actions[:4]
 
 
+def _resolve_availability_dependencies(payload: AvailabilityEventCreate | AvailabilityEventUpdate, db: Session) -> tuple[Doctor, Doctor | None]:
+    doctor = db.query(Doctor).filter(Doctor.id == payload.doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    if payload.start_date > payload.end_date:
+        raise HTTPException(status_code=400, detail="Start date must be on or before end date")
+
+    related_doctor = None
+    if payload.related_doctor_id:
+        related_doctor = db.query(Doctor).filter(Doctor.id == payload.related_doctor_id).first()
+        if not related_doctor:
+            raise HTTPException(status_code=404, detail="Related doctor not found")
+        if related_doctor.hospital_site != doctor.hospital_site:
+            raise HTTPException(status_code=400, detail="Related doctor must be from the same hospital site")
+
+    if payload.event_type == AvailabilityEventType.SHIFT_SWAP and not payload.related_doctor_id:
+        raise HTTPException(status_code=400, detail="Shift swap requests require a related doctor")
+
+    return doctor, related_doctor
+
+
+def _resolve_shift_or_404(shift_code: str, db: Session) -> ShiftType:
+    shift = db.query(ShiftType).filter(ShiftType.code == shift_code).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift pattern not found")
+    return shift
+
+
 @router.get("/workspace")
 def get_operations_workspace(db: Session = Depends(get_db)):
     doctors = db.query(Doctor).all()
@@ -552,23 +582,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
 
 @router.post("/availability-events", status_code=201)
 def create_availability_event(payload: AvailabilityEventCreate, db: Session = Depends(get_db)):
-    doctor = db.query(Doctor).filter(Doctor.id == payload.doctor_id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
-
-    if payload.start_date > payload.end_date:
-        raise HTTPException(status_code=400, detail="Start date must be on or before end date")
-
-    related_doctor = None
-    if payload.related_doctor_id:
-        related_doctor = db.query(Doctor).filter(Doctor.id == payload.related_doctor_id).first()
-        if not related_doctor:
-            raise HTTPException(status_code=404, detail="Related doctor not found")
-        if related_doctor.hospital_site != doctor.hospital_site:
-            raise HTTPException(status_code=400, detail="Related doctor must be from the same hospital site")
-
-    if payload.event_type == AvailabilityEventType.SHIFT_SWAP and not payload.related_doctor_id:
-        raise HTTPException(status_code=400, detail="Shift swap requests require a related doctor")
+    doctor, related_doctor = _resolve_availability_dependencies(payload, db)
 
     event = DoctorAvailabilityEvent(
         id=str(uuid.uuid4()),
@@ -591,11 +605,35 @@ def create_availability_event(payload: AvailabilityEventCreate, db: Session = De
     return _serialize_event(event, doctors_by_id)
 
 
+@router.put("/availability-events/{event_id}")
+def update_availability_event(event_id: str, payload: AvailabilityEventUpdate, db: Session = Depends(get_db)):
+    event = db.query(DoctorAvailabilityEvent).filter(DoctorAvailabilityEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Availability event not found")
+    if str(event.status).upper() == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Cancelled events cannot be edited")
+
+    doctor, related_doctor = _resolve_availability_dependencies(payload, db)
+    event.doctor_id = payload.doctor_id
+    event.hospital_site = doctor.hospital_site
+    event.event_type = payload.event_type
+    event.start_date = payload.start_date
+    event.end_date = payload.end_date
+    event.session_label = payload.session_label
+    event.status = payload.status
+    event.reason_category = payload.reason_category
+    event.related_doctor_id = payload.related_doctor_id
+    event.notes = payload.notes
+    db.commit()
+    db.refresh(event)
+
+    doctors_by_id = {item.id: item for item in [doctor] + ([related_doctor] if related_doctor else [])}
+    return _serialize_event(event, doctors_by_id)
+
+
 @router.post("/locum-requests", status_code=201)
 def create_locum_request(payload: LocumRequestCreate, db: Session = Depends(get_db)):
-    shift = db.query(ShiftType).filter(ShiftType.code == payload.shift_code).first()
-    if not shift:
-        raise HTTPException(status_code=404, detail="Shift pattern not found")
+    shift = _resolve_shift_or_404(payload.shift_code, db)
 
     approval_status = (
         LocumApprovalStatus.PENDING_APPROVAL
@@ -622,6 +660,45 @@ def create_locum_request(payload: LocumRequestCreate, db: Session = Depends(get_
         notes=payload.notes,
     )
     db.add(locum_request)
+    db.commit()
+    db.refresh(locum_request)
+
+    shift_pattern = _build_shift_pattern(shift)
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern})
+
+
+@router.put("/locum-requests/{request_id}")
+def update_locum_request(request_id: str, payload: LocumRequestUpdate, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
+    if approval_status in {LocumApprovalStatus.FILLED.value, LocumApprovalStatus.DECLINED.value}:
+        raise HTTPException(status_code=400, detail="Filled or cancelled requests cannot be edited")
+
+    shift = _resolve_shift_or_404(payload.shift_code, db)
+    locum_request.hospital_site = payload.hospital_site
+    locum_request.department = payload.department
+    locum_request.ward = payload.ward
+    locum_request.requested_date = payload.requested_date
+    locum_request.shift_type_id = shift.id
+    locum_request.required_grade = payload.required_grade
+    locum_request.compliance_level = payload.compliance_level
+    locum_request.staff_type = payload.staff_type
+    locum_request.approval_required = payload.approval_required
+    locum_request.requested_hours = payload.requested_hours
+    locum_request.estimated_cost = _estimate_locum_cost(payload.required_grade, payload.staff_type, payload.requested_hours)
+    locum_request.shortage_reason = payload.shortage_reason
+    locum_request.requested_by = payload.requested_by
+    locum_request.notes = payload.notes
+
+    locum_request.approval_status = (
+        LocumApprovalStatus.PENDING_APPROVAL if payload.approval_required else LocumApprovalStatus.APPROVED
+    )
+    if locum_request.approval_status == LocumApprovalStatus.PENDING_APPROVAL:
+        locum_request.approved_by = None
+
     db.commit()
     db.refresh(locum_request)
 
