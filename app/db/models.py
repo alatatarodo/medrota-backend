@@ -292,3 +292,22 @@ class LocumRequest(Base):
     __table_args__ = (
         Index("idx_locum_request_site_date", "hospital_site", "requested_date"),
     )
+
+
+class OperationAuditLog(Base):
+    __tablename__ = "operation_audit_logs"
+
+    id = Column(String(36), primary_key=True)
+    entity_type = Column(String(50), nullable=False)
+    entity_id = Column(String(36), nullable=False)
+    action = Column(String(50), nullable=False)
+    hospital_site = Column(String(100))
+    actor_name = Column(String(100))
+    summary = Column(String(255), nullable=False)
+    detail = Column(Text)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_operation_audit_created_at", "created_at"),
+        Index("idx_operation_audit_entity", "entity_type", "entity_id"),
+    )

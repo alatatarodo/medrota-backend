@@ -17,6 +17,7 @@ from app.db.models import (
     GeneratedSchedule,
     LocumApprovalStatus,
     LocumRequest,
+    OperationAuditLog,
     ScheduleAssignment,
     ShiftType,
 )
@@ -474,6 +475,45 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
     return actions[:4]
 
 
+def _record_audit_event(
+    db: Session,
+    *,
+    entity_type: str,
+    entity_id: str,
+    action: str,
+    hospital_site: str | None,
+    actor_name: str | None,
+    summary: str,
+    detail: str | None = None,
+) -> None:
+    db.add(
+        OperationAuditLog(
+            id=str(uuid.uuid4()),
+            entity_type=entity_type,
+            entity_id=entity_id,
+            action=action,
+            hospital_site=hospital_site,
+            actor_name=actor_name,
+            summary=summary,
+            detail=detail,
+        )
+    )
+
+
+def _serialize_audit_log(entry: OperationAuditLog) -> dict:
+    return {
+        "id": entry.id,
+        "entity_type": entry.entity_type,
+        "entity_id": entry.entity_id,
+        "action": entry.action,
+        "hospital_site": entry.hospital_site,
+        "actor_name": entry.actor_name,
+        "summary": entry.summary,
+        "detail": entry.detail,
+        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+    }
+
+
 def _resolve_availability_dependencies(payload: AvailabilityEventCreate | AvailabilityEventUpdate, db: Session) -> tuple[Doctor, Doctor | None]:
     doctor = db.query(Doctor).filter(Doctor.id == payload.doctor_id).first()
     if not doctor:
@@ -511,6 +551,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
     shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
     events = db.query(DoctorAvailabilityEvent).order_by(DoctorAvailabilityEvent.start_date.asc()).limit(20).all()
     locum_requests = db.query(LocumRequest).order_by(LocumRequest.requested_date.asc()).all()
+    audit_logs = db.query(OperationAuditLog).order_by(OperationAuditLog.created_at.desc()).limit(12).all()
     latest_schedule = db.query(GeneratedSchedule).filter(
         GeneratedSchedule.generated_successfully == True  # noqa: E712
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
@@ -565,6 +606,7 @@ def get_operations_workspace(db: Session = Depends(get_db)):
         "shift_patterns": shift_patterns,
         "leave_events": [_serialize_event(event, doctors_by_id) for event in events],
         "locum_requests": [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests],
+        "activity_feed": [_serialize_audit_log(entry) for entry in audit_logs],
         "compliance": _build_compliance_payload(locum_requests, shift_patterns),
         "reference_data": {
             "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
@@ -598,6 +640,16 @@ def create_availability_event(payload: AvailabilityEventCreate, db: Session = De
         notes=payload.notes,
     )
     db.add(event)
+    _record_audit_event(
+        db,
+        entity_type="availability_event",
+        entity_id=event.id,
+        action="CREATED",
+        hospital_site=doctor.hospital_site,
+        actor_name="Operations Workspace",
+        summary=f"{EVENT_LABELS.get(payload.event_type, payload.event_type.value)} created for {doctor.first_name} {doctor.last_name}",
+        detail=payload.notes,
+    )
     db.commit()
     db.refresh(event)
 
@@ -624,6 +676,16 @@ def update_availability_event(event_id: str, payload: AvailabilityEventUpdate, d
     event.reason_category = payload.reason_category
     event.related_doctor_id = payload.related_doctor_id
     event.notes = payload.notes
+    _record_audit_event(
+        db,
+        entity_type="availability_event",
+        entity_id=event.id,
+        action="UPDATED",
+        hospital_site=doctor.hospital_site,
+        actor_name="Operations Workspace",
+        summary=f"Availability event updated for {doctor.first_name} {doctor.last_name}",
+        detail=payload.notes,
+    )
     db.commit()
     db.refresh(event)
 
@@ -660,6 +722,16 @@ def create_locum_request(payload: LocumRequestCreate, db: Session = Depends(get_
         notes=payload.notes,
     )
     db.add(locum_request)
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="CREATED",
+        hospital_site=payload.hospital_site,
+        actor_name=payload.requested_by or "Operations Workspace",
+        summary=f"Locum request created for {payload.ward} ({payload.shift_code})",
+        detail=payload.shortage_reason,
+    )
     db.commit()
     db.refresh(locum_request)
 
@@ -699,6 +771,16 @@ def update_locum_request(request_id: str, payload: LocumRequestUpdate, db: Sessi
     if locum_request.approval_status == LocumApprovalStatus.PENDING_APPROVAL:
         locum_request.approved_by = None
 
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="UPDATED",
+        hospital_site=payload.hospital_site,
+        actor_name=payload.requested_by or "Operations Workspace",
+        summary=f"Locum request updated for {payload.ward} ({payload.shift_code})",
+        detail=payload.shortage_reason,
+    )
     db.commit()
     db.refresh(locum_request)
 
@@ -719,6 +801,16 @@ def approve_locum_request(request_id: str, body: dict | None = None, db: Session
     approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
     locum_request.approval_status = LocumApprovalStatus.APPROVED
     locum_request.approved_by = approved_by
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="APPROVED",
+        hospital_site=locum_request.hospital_site,
+        actor_name=approved_by,
+        summary=f"Locum request approved for {locum_request.ward}",
+        detail=locum_request.shortage_reason,
+    )
     db.commit()
 
     return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.APPROVED.value}
@@ -735,6 +827,16 @@ def cancel_availability_event(event_id: str, body: dict | None = None, db: Sessi
     if notes:
         existing_notes = event.notes or ""
         event.notes = f"{existing_notes}\nCancelled: {notes}".strip()
+    _record_audit_event(
+        db,
+        entity_type="availability_event",
+        entity_id=event.id,
+        action="CANCELLED",
+        hospital_site=event.hospital_site,
+        actor_name="Operations Workspace",
+        summary=f"Availability event cancelled for doctor {event.doctor_id}",
+        detail=notes,
+    )
     db.commit()
 
     doctors = db.query(Doctor).filter(Doctor.id.in_([doctor_id for doctor_id in [event.doctor_id, event.related_doctor_id] if doctor_id])).all()
@@ -757,6 +859,16 @@ def update_availability_event_status(event_id: str, body: dict | None = None, db
     if note:
         existing_notes = event.notes or ""
         event.notes = f"{existing_notes}\nStatus update: {note}".strip()
+    _record_audit_event(
+        db,
+        entity_type="availability_event",
+        entity_id=event.id,
+        action=f"STATUS_{requested_status}",
+        hospital_site=event.hospital_site,
+        actor_name="Operations Workspace",
+        summary=f"Availability event moved to {requested_status}",
+        detail=note,
+    )
     db.commit()
 
     doctors = db.query(Doctor).filter(Doctor.id.in_([doctor_id for doctor_id in [event.doctor_id, event.related_doctor_id] if doctor_id])).all()
@@ -778,6 +890,16 @@ def cancel_locum_request(request_id: str, body: dict | None = None, db: Session 
     if reason:
         existing_notes = locum_request.notes or ""
         locum_request.notes = f"{existing_notes}\nCancelled: {reason}".strip()
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="CANCELLED",
+        hospital_site=locum_request.hospital_site,
+        actor_name="Operations Workspace",
+        summary=f"Locum request cancelled for {locum_request.ward}",
+        detail=reason,
+    )
     db.commit()
 
     shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
@@ -800,6 +922,16 @@ def book_locum_request(request_id: str, body: dict | None = None, db: Session = 
     locum_request.approval_status = LocumApprovalStatus.FILLED
     if not locum_request.approved_by:
         locum_request.approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="BOOKED",
+        hospital_site=locum_request.hospital_site,
+        actor_name=locum_request.approved_by or "Operations Workspace",
+        summary=f"Locum cover booked for {locum_request.ward}",
+        detail=f"Booked staff: {booked_name}",
+    )
     db.commit()
 
     return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.FILLED.value}
