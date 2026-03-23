@@ -93,6 +93,33 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
     }
 
 
+def _build_assignment_query(
+    schedule_id: str,
+    db: Session,
+    doctor_id: str = None,
+    hospital_site: str = None,
+    date_from: date = None,
+    date_to: date = None,
+):
+    query = db.query(ScheduleAssignment, Doctor).join(Doctor, Doctor.id == ScheduleAssignment.doctor_id).filter(
+        ScheduleAssignment.schedule_id == schedule_id
+    )
+
+    if doctor_id:
+        query = query.filter(ScheduleAssignment.doctor_id == doctor_id)
+
+    if hospital_site:
+        query = query.filter(Doctor.hospital_site == hospital_site)
+
+    if date_from:
+        query = query.filter(ScheduleAssignment.assignment_date >= date_from)
+
+    if date_to:
+        query = query.filter(ScheduleAssignment.assignment_date <= date_to)
+
+    return query
+
+
 @router.get("/dashboard-summary", response_model=dict)
 def get_dashboard_summary(db: Session = Depends(get_db)):
     """Return summary metrics for the dashboard overview."""
@@ -351,24 +378,15 @@ def list_assignments(
     db: Session = Depends(get_db)
 ):
     """List assignments with optional filters"""
-    
-    query = db.query(ScheduleAssignment, Doctor).join(Doctor, Doctor.id == ScheduleAssignment.doctor_id).filter(
-        ScheduleAssignment.schedule_id == schedule_id
-    )
-    
-    if doctor_id:
-        query = query.filter(ScheduleAssignment.doctor_id == doctor_id)
 
-    if hospital_site:
-        query = query.filter(Doctor.hospital_site == hospital_site)
-    
-    if date_from:
-        query = query.filter(ScheduleAssignment.assignment_date >= date_from)
-    
-    if date_to:
-        query = query.filter(ScheduleAssignment.assignment_date <= date_to)
-    
-    assignment_rows = query.order_by(ScheduleAssignment.assignment_date).all()
+    assignment_rows = _build_assignment_query(
+        schedule_id=schedule_id,
+        db=db,
+        doctor_id=doctor_id,
+        hospital_site=hospital_site,
+        date_from=date_from,
+        date_to=date_to,
+    ).order_by(ScheduleAssignment.assignment_date).all()
     return [
         ScheduleAssignmentResponse(
             id=assignment.id,
@@ -386,7 +404,10 @@ def list_assignments(
 @router.get("/{schedule_id}/assignments/export")
 def export_assignments(
     schedule_id: str,
+    doctor_id: str = None,
     hospital_site: str = None,
+    date_from: date = None,
+    date_to: date = None,
     db: Session = Depends(get_db)
 ):
     """Export schedule assignments as CSV."""
@@ -395,14 +416,14 @@ def export_assignments(
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    query = db.query(ScheduleAssignment, Doctor).join(Doctor, Doctor.id == ScheduleAssignment.doctor_id).filter(
-        ScheduleAssignment.schedule_id == schedule_id
-    )
-
-    if hospital_site:
-        query = query.filter(Doctor.hospital_site == hospital_site)
-
-    assignment_rows = query.order_by(ScheduleAssignment.assignment_date, Doctor.last_name, Doctor.first_name).all()
+    assignment_rows = _build_assignment_query(
+        schedule_id=schedule_id,
+        db=db,
+        doctor_id=doctor_id,
+        hospital_site=hospital_site,
+        date_from=date_from,
+        date_to=date_to,
+    ).order_by(ScheduleAssignment.assignment_date, Doctor.last_name, Doctor.first_name).all()
 
     buffer = StringIO()
     writer = csv.writer(buffer)
@@ -419,7 +440,11 @@ def export_assignments(
         ])
 
     scope_label = hospital_site.replace(" ", "-").lower() if hospital_site else "all-sites"
-    filename = f"schedule-{schedule_id}-{scope_label}.csv"
+    date_label = ""
+    if date_from or date_to:
+        date_label = f"-{date_from.isoformat() if date_from else 'start'}-to-{date_to.isoformat() if date_to else 'end'}"
+    doctor_label = f"-{doctor_id}" if doctor_id else ""
+    filename = f"schedule-{schedule_id}-{scope_label}{doctor_label}{date_label}.csv"
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv",
