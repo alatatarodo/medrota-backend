@@ -1,7 +1,10 @@
 from collections import defaultdict
+import csv
 from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from datetime import date
+from io import StringIO
 import json
 from app.db.database import get_db
 from app.db.models import GeneratedSchedule, ScheduleAssignment, ComplianceViolation, FairnessMetric, Doctor
@@ -65,6 +68,31 @@ def _parse_schedule_notes(notes: str) -> dict:
         return {}
 
 
+def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
+    assignments = db.query(ScheduleAssignment).filter(
+        ScheduleAssignment.schedule_id == schedule.id
+    ).all()
+    doctors = _get_schedule_doctors(schedule.id, db)
+    notes = _parse_schedule_notes(schedule.notes)
+
+    return {
+        "id": schedule.id,
+        "year": schedule.schedule_year,
+        "generated_at": schedule.generated_at.isoformat(),
+        "status": "complete" if schedule.generated_successfully else "failed",
+        "selected_hospital_sites": notes.get("hospital_sites", []),
+        "error": notes.get("error"),
+        "metrics": {
+            "total_doctors": schedule.total_doctors,
+            "compliance_score": schedule.compliance_score,
+            "fairness_score": schedule.fairness_score,
+            "exception_count": schedule.exception_count,
+            "total_assignments": len(assignments),
+        },
+        "hospital_breakdown": _build_hospital_breakdown(doctors, assignments),
+    }
+
+
 @router.get("/dashboard-summary", response_model=dict)
 def get_dashboard_summary(db: Session = Depends(get_db)):
     """Return summary metrics for the dashboard overview."""
@@ -80,27 +108,7 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
     latest_schedule_summary = None
 
     if latest_schedule:
-        latest_schedule_doctors = _get_schedule_doctors(latest_schedule.id, db)
-        latest_schedule_assignments = db.query(ScheduleAssignment).filter(
-            ScheduleAssignment.schedule_id == latest_schedule.id
-        ).all()
-        notes = _parse_schedule_notes(latest_schedule.notes)
-
-        latest_schedule_summary = {
-            "id": latest_schedule.id,
-            "year": latest_schedule.schedule_year,
-            "generated_at": latest_schedule.generated_at.isoformat(),
-            "status": "complete" if latest_schedule.generated_successfully else "failed",
-            "selected_hospital_sites": notes.get("hospital_sites", []),
-            "metrics": {
-                "total_doctors": latest_schedule.total_doctors,
-                "compliance_score": latest_schedule.compliance_score,
-                "fairness_score": latest_schedule.fairness_score,
-                "exception_count": latest_schedule.exception_count,
-                "total_assignments": len(latest_schedule_assignments),
-            },
-            "hospital_breakdown": _build_hospital_breakdown(latest_schedule_doctors, latest_schedule_assignments),
-        }
+        latest_schedule_summary = _build_schedule_summary(latest_schedule, db)
 
     return {
         "doctor_count": len(doctors),
@@ -108,6 +116,14 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         "generated_schedule_count": len(schedules),
         "latest_schedule": latest_schedule_summary,
     }
+
+
+@router.get("/", response_model=list[dict])
+def list_schedules(limit: int = 10, db: Session = Depends(get_db)):
+    """List recent generated schedules with summary metrics."""
+
+    schedules = db.query(GeneratedSchedule).order_by(GeneratedSchedule.generated_at.desc()).limit(limit).all()
+    return [_build_schedule_summary(schedule, db) for schedule in schedules]
 
 
 @router.post("/generate", response_model=ScheduleGenerationStatus)
@@ -159,26 +175,8 @@ def get_schedule(schedule_id: str, db: Session = Depends(get_db)):
     schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    
-    assignments = db.query(ScheduleAssignment).filter(
-        ScheduleAssignment.schedule_id == schedule_id
-    ).all()
-    doctors = _get_schedule_doctors(schedule_id, db)
 
-    return {
-        "id": schedule.id,
-        "year": schedule.schedule_year,
-        "generated_at": schedule.generated_at.isoformat(),
-        "status": "complete" if schedule.generated_successfully else "failed",
-        "metrics": {
-            "total_doctors": schedule.total_doctors,
-            "compliance_score": schedule.compliance_score,
-            "fairness_score": schedule.fairness_score,
-            "exception_count": schedule.exception_count
-        },
-        "hospital_breakdown": _build_hospital_breakdown(doctors, assignments),
-        "total_assignments": len(assignments)
-    }
+    return _build_schedule_summary(schedule, db)
 
 
 @router.get("/{schedule_id}/compliance-report")
@@ -383,6 +381,50 @@ def list_assignments(
         )
         for assignment, doctor in assignment_rows
     ]
+
+
+@router.get("/{schedule_id}/assignments/export")
+def export_assignments(
+    schedule_id: str,
+    hospital_site: str = None,
+    db: Session = Depends(get_db)
+):
+    """Export schedule assignments as CSV."""
+
+    schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    query = db.query(ScheduleAssignment, Doctor).join(Doctor, Doctor.id == ScheduleAssignment.doctor_id).filter(
+        ScheduleAssignment.schedule_id == schedule_id
+    )
+
+    if hospital_site:
+        query = query.filter(Doctor.hospital_site == hospital_site)
+
+    assignment_rows = query.order_by(ScheduleAssignment.assignment_date, Doctor.last_name, Doctor.first_name).all()
+
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["assignment_date", "doctor_id", "doctor_name", "hospital_site", "shift_type_id", "status"])
+
+    for assignment, doctor in assignment_rows:
+        writer.writerow([
+            assignment.assignment_date.isoformat(),
+            assignment.doctor_id,
+            f"{doctor.first_name} {doctor.last_name}",
+            doctor.hospital_site,
+            assignment.shift_type_id or "",
+            assignment.status.value if hasattr(assignment.status, "value") else str(assignment.status),
+        ])
+
+    scope_label = hospital_site.replace(" ", "-").lower() if hospital_site else "all-sites"
+    filename = f"schedule-{schedule_id}-{scope_label}.csv"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
 @router.post("/{schedule_id}/assignments/{assignment_id}/override")
