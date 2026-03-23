@@ -462,41 +462,73 @@ class SchedulingEngine:
     def _select_shift_for_doctor(self, doctor: Doctor, shift_types_by_code: Dict[str, ShiftType], 
                                 current_date: date) -> Optional[ShiftType]:
         """Select appropriate shift type for doctor"""
-        
-        # FY1: daytime only
+
+        def pick(*codes: str) -> Optional[ShiftType]:
+            for code in codes:
+                if shift_types_by_code.get(code):
+                    return shift_types_by_code.get(code)
+            return None
+
+        # FY1: morning/daytime only
         if doctor.grade == DoctorGrade.FY1:
-            return shift_types_by_code.get("DAYTIME")
-        
+            return pick("MORNING", "DAYTIME")
+
         # Rotate shift types for other grades
         day_of_week = current_date.weekday()
-        
-        # Weekends get different distribution
-        if day_of_week >= 4:  # Weekend
-            return shift_types_by_code.get("DAYTIME") or shift_types_by_code.get("NIGHT")
-        
-        # Weekdays
+
+        if doctor.grade in {DoctorGrade.FY2, DoctorGrade.ST1, DoctorGrade.ST2}:
+            if day_of_week >= 4:
+                return pick("LONG_DAY", "EVENING", "MORNING", "DAYTIME")
+            return pick("MORNING", "EVENING", "DAYTIME")
+
+        if doctor.grade in {DoctorGrade.CONSULTANT, DoctorGrade.REGISTRAR, DoctorGrade.ST6, DoctorGrade.ST7, DoctorGrade.ST8}:
+            if day_of_week == 0:
+                return pick("ONCALL", "MORNING", "DAYTIME")
+            if day_of_week in {4, 5}:
+                return pick("NIGHT", "TWILIGHT", "LONG_DAY")
+            return pick("TWILIGHT", "MORNING", "EVENING")
+
+        if day_of_week >= 5:
+            return pick("TWILIGHT", "LONG_DAY", "NIGHT", "DAYTIME")
         if day_of_week % 3 == 0:
-            return shift_types_by_code.get("NIGHT")
-        else:
-            return shift_types_by_code.get("DAYTIME")
+            return pick("NIGHT", "TWILIGHT", "EVENING")
+        if day_of_week % 2 == 0:
+            return pick("EVENING", "MORNING", "DAYTIME")
+        return pick("MORNING", "DAYTIME")
     
     def _create_default_shift_types(self):
         """Create default shift types if none exist"""
         
         default_shifts = [
             {
-                "code": "DAYTIME",
-                "name": "Day Shift",
+                "code": "MORNING",
+                "name": "Morning Shift",
                 "duration_hours": 8,
-                "availability_grades": ["FY1", "FY2", "SHO", "Registrar", "Consultant"],
+                "availability_grades": ["FY1", "FY2", "SHO", "Registrar", "Consultant", "ST1", "ST2", "ST3", "ST4", "ST5", "ST6", "ST7", "ST8"],
+                "is_night_shift": False,
+                "is_on_call": False,
+            },
+            {
+                "code": "EVENING",
+                "name": "Evening Shift",
+                "duration_hours": 8,
+                "availability_grades": ["FY2", "SHO", "Registrar", "Consultant", "ST1", "ST2", "ST3", "ST4", "ST5", "ST6", "ST7", "ST8"],
+                "is_night_shift": False,
+                "is_on_call": False,
+            },
+            {
+                "code": "TWILIGHT",
+                "name": "Twilight Shift",
+                "duration_hours": 10,
+                "availability_grades": ["SHO", "Registrar", "Consultant", "ST2", "ST3", "ST4", "ST5", "ST6", "ST7", "ST8"],
                 "is_night_shift": False,
                 "is_on_call": False,
             },
             {
                 "code": "LONG_DAY",
                 "name": "Long Day",
-                "duration_hours": 10,
-                "availability_grades": ["FY2", "SHO", "Registrar", "Consultant"],
+                "duration_hours": 12,
+                "availability_grades": ["FY2", "SHO", "Registrar", "Consultant", "ST2", "ST3", "ST4", "ST5", "ST6", "ST7", "ST8"],
                 "is_night_shift": False,
                 "is_on_call": False,
             },
@@ -504,15 +536,15 @@ class SchedulingEngine:
                 "code": "NIGHT",
                 "name": "Night Shift",
                 "duration_hours": 10,
-                "availability_grades": ["FY2", "SHO", "Registrar", "Consultant"],
+                "availability_grades": ["SHO", "Registrar", "Consultant", "ST3", "ST4", "ST5", "ST6", "ST7", "ST8"],
                 "is_night_shift": True,
                 "is_on_call": False,
             },
             {
                 "code": "ONCALL",
                 "name": "On-Call",
-                "duration_hours": 24,
-                "availability_grades": ["SHO", "Registrar", "Consultant"],
+                "duration_hours": 12,
+                "availability_grades": ["Registrar", "Consultant", "ST4", "ST5", "ST6", "ST7", "ST8"],
                 "is_night_shift": False,
                 "is_on_call": True,
             },

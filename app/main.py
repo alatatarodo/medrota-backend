@@ -4,7 +4,7 @@ from sqlalchemy import inspect, text
 from app.core.config import settings
 from app.db.database import Base, SessionLocal, engine
 from app.bootstrap import seed_sample_data
-from app.api import doctors, schedule
+from app.api import doctors, operations, schedule
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -49,6 +49,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(doctors.router)
+app.include_router(operations.router)
 app.include_router(schedule.router)
 
 

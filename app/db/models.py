@@ -35,6 +35,37 @@ class AssignmentStatus(str, enum.Enum):
     MANUAL_OVERRIDE = "MANUAL_OVERRIDE"
 
 
+class AvailabilityEventType(str, enum.Enum):
+    ZERO_DAY = "ZERO_DAY"
+    TCPD_DAY = "TCPD_DAY"
+    TEACHING_DAY = "TEACHING_DAY"
+    SICKNESS = "SICKNESS"
+    PATERNITY_LEAVE = "PATERNITY_LEAVE"
+    MATERNITY_LEAVE = "MATERNITY_LEAVE"
+    ANNUAL_LEAVE = "ANNUAL_LEAVE"
+    SHIFT_SWAP = "SHIFT_SWAP"
+
+
+class ComplianceLevel(str, enum.Enum):
+    STANDARD = "STANDARD"
+    ENHANCED = "ENHANCED"
+    CRITICAL = "CRITICAL"
+
+
+class LocumStaffType(str, enum.Enum):
+    BANK = "BANK"
+    AGENCY = "AGENCY"
+    INTERNAL = "INTERNAL"
+
+
+class LocumApprovalStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    FILLED = "FILLED"
+    DECLINED = "DECLINED"
+
+
 # Doctor Model
 class Doctor(Base):
     __tablename__ = "doctors"
@@ -54,6 +85,12 @@ class Doctor(Base):
     contracts = relationship("Contract", back_populates="doctor", cascade="all, delete-orphan")
     special_requirements = relationship("SpecialRequirement", back_populates="doctor", cascade="all, delete-orphan")
     assignments = relationship("ScheduleAssignment", back_populates="doctor")
+    availability_events = relationship(
+        "DoctorAvailabilityEvent",
+        back_populates="doctor",
+        cascade="all, delete-orphan",
+        foreign_keys="DoctorAvailabilityEvent.doctor_id",
+    )
 
 
 # Contract Model
@@ -204,3 +241,54 @@ class FairnessMetric(Base):
     
     # Relationships
     schedule = relationship("GeneratedSchedule", back_populates="fairness_metrics")
+
+
+class DoctorAvailabilityEvent(Base):
+    __tablename__ = "doctor_availability_events"
+
+    id = Column(String(36), primary_key=True)
+    doctor_id = Column(String(36), ForeignKey("doctors.id"), nullable=False)
+    hospital_site = Column(String(100), nullable=False)
+    event_type = Column(Enum(AvailabilityEventType), nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    session_label = Column(String(50), default="ALL_DAY")
+    status = Column(String(30), default="APPROVED")
+    reason_category = Column(String(100))
+    related_doctor_id = Column(String(36), ForeignKey("doctors.id"))
+    notes = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+
+    doctor = relationship("Doctor", back_populates="availability_events", foreign_keys=[doctor_id])
+
+    __table_args__ = (
+        Index("idx_availability_doctor_dates", "doctor_id", "start_date", "end_date"),
+    )
+
+
+class LocumRequest(Base):
+    __tablename__ = "locum_requests"
+
+    id = Column(String(36), primary_key=True)
+    hospital_site = Column(String(100), nullable=False)
+    department = Column(String(100), nullable=False)
+    ward = Column(String(100), nullable=False)
+    requested_date = Column(Date, nullable=False)
+    shift_type_id = Column(String(36), ForeignKey("shift_types.id"))
+    required_grade = Column(Enum(DoctorGrade), nullable=False)
+    compliance_level = Column(Enum(ComplianceLevel), nullable=False, default=ComplianceLevel.STANDARD)
+    staff_type = Column(Enum(LocumStaffType), nullable=False, default=LocumStaffType.BANK)
+    approval_status = Column(Enum(LocumApprovalStatus), nullable=False, default=LocumApprovalStatus.PENDING_APPROVAL)
+    approval_required = Column(Boolean, default=True)
+    requested_hours = Column(Integer, nullable=False, default=8)
+    estimated_cost = Column(Float, default=0)
+    shortage_reason = Column(String(255))
+    requested_by = Column(String(100))
+    approved_by = Column(String(100))
+    booked_doctor_name = Column(String(100))
+    notes = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index("idx_locum_request_site_date", "hospital_site", "requested_date"),
+    )

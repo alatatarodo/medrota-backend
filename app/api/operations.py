@@ -1,0 +1,432 @@
+from collections import defaultdict
+from datetime import date, timedelta
+import json
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.db.database import get_db
+from app.db.models import (
+    AvailabilityEventType,
+    ComplianceLevel,
+    Doctor,
+    DoctorAvailabilityEvent,
+    DoctorGrade,
+    GeneratedSchedule,
+    LocumApprovalStatus,
+    LocumRequest,
+    ScheduleAssignment,
+    ShiftType,
+)
+
+router = APIRouter(prefix="/api/v1/operations", tags=["operations"])
+
+GRADE_ORDER = [
+    "FY1",
+    "FY2",
+    "SHO",
+    "ST1",
+    "ST2",
+    "ST3",
+    "ST4",
+    "ST5",
+    "ST6",
+    "ST7",
+    "ST8",
+    "Registrar",
+    "Consultant",
+]
+
+SHIFT_METADATA = {
+    "MORNING": {"window": "07:00 - 15:00", "label": "Morning cover", "rate": 42, "min_grade": "FY1"},
+    "EVENING": {"window": "13:00 - 21:00", "label": "Evening cover", "rate": 54, "min_grade": "FY2"},
+    "TWILIGHT": {"window": "16:00 - 02:00", "label": "Twilight surge cover", "rate": 68, "min_grade": "SHO"},
+    "NIGHT": {"window": "21:00 - 07:00", "label": "Resident night cover", "rate": 82, "min_grade": "ST3"},
+    "LONG_DAY": {"window": "08:00 - 20:00", "label": "Long day cover", "rate": 64, "min_grade": "FY2"},
+    "ONCALL": {"window": "20:00 - 08:00", "label": "Non-resident on-call", "rate": 95, "min_grade": "Registrar"},
+    "DAYTIME": {"window": "08:00 - 16:00", "label": "Day shift", "rate": 42, "min_grade": "FY1"},
+}
+
+EVENT_LABELS = {
+    AvailabilityEventType.ZERO_DAY: "Zero Day",
+    AvailabilityEventType.TCPD_DAY: "TCPD Day",
+    AvailabilityEventType.TEACHING_DAY: "Teaching Day",
+    AvailabilityEventType.SICKNESS: "Sickness",
+    AvailabilityEventType.PATERNITY_LEAVE: "Paternity Leave",
+    AvailabilityEventType.MATERNITY_LEAVE: "Maternity Leave",
+    AvailabilityEventType.ANNUAL_LEAVE: "Annual Leave",
+    AvailabilityEventType.SHIFT_SWAP: "Shift Swap",
+}
+
+
+def _grade_value(grade: str) -> int:
+    try:
+        return GRADE_ORDER.index(grade)
+    except ValueError:
+        return len(GRADE_ORDER)
+
+
+def _parse_allowed_grades(raw_value) -> list[str]:
+    if not raw_value:
+        return []
+    if isinstance(raw_value, list):
+        return [str(item) for item in raw_value]
+    try:
+        parsed = json.loads(raw_value)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except (TypeError, json.JSONDecodeError):
+        pass
+    return [item.strip() for item in str(raw_value).split(",") if item.strip()]
+
+
+def _build_shift_pattern(shift: ShiftType) -> dict:
+    shift_code = shift.code or "UNKNOWN"
+    metadata = SHIFT_METADATA.get(shift_code, {})
+    eligible_grades = sorted(_parse_allowed_grades(shift.availability_grades), key=_grade_value)
+    compliance_level = (
+        ComplianceLevel.CRITICAL.value if shift.is_on_call
+        else ComplianceLevel.ENHANCED.value if shift.is_night_shift or shift_code == "TWILIGHT"
+        else ComplianceLevel.STANDARD.value
+    )
+    approval_required = compliance_level != ComplianceLevel.STANDARD.value
+
+    return {
+        "id": shift.id,
+        "code": shift_code,
+        "name": shift.name,
+        "shift_window": metadata.get("window", "TBC"),
+        "focus": metadata.get("label", "Operational shift"),
+        "duration_hours": shift.duration_hours,
+        "eligible_grades": eligible_grades,
+        "minimum_grade": metadata.get("min_grade") or (eligible_grades[0] if eligible_grades else "FY1"),
+        "compliance_level": compliance_level,
+        "approval_required": approval_required,
+        "estimated_bank_rate_per_hour": metadata.get("rate", 50),
+        "is_night_shift": shift.is_night_shift,
+        "is_on_call": shift.is_on_call,
+    }
+
+
+def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Doctor]) -> dict:
+    doctor = doctors_by_id.get(event.doctor_id)
+    related_doctor = doctors_by_id.get(event.related_doctor_id) if event.related_doctor_id else None
+    return {
+        "id": event.id,
+        "doctor_id": event.doctor_id,
+        "doctor_name": f"{doctor.first_name} {doctor.last_name}" if doctor else "Unknown",
+        "doctor_grade": doctor.grade.value if doctor and hasattr(doctor.grade, "value") else str(doctor.grade) if doctor else "Unknown",
+        "hospital_site": event.hospital_site,
+        "event_type": event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
+        "event_label": EVENT_LABELS.get(event.event_type, str(event.event_type)),
+        "start_date": event.start_date.isoformat(),
+        "end_date": event.end_date.isoformat(),
+        "session_label": event.session_label,
+        "status": event.status,
+        "reason_category": event.reason_category,
+        "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
+        "notes": event.notes,
+    }
+
+
+def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[str, dict]) -> dict:
+    shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
+    return {
+        "id": request.id,
+        "hospital_site": request.hospital_site,
+        "department": request.department,
+        "ward": request.ward,
+        "requested_date": request.requested_date.isoformat(),
+        "shift_code": shift_pattern.get("code"),
+        "shift_name": shift_pattern.get("name", "Unmapped shift"),
+        "shift_window": shift_pattern.get("shift_window"),
+        "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
+        "compliance_level": request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level),
+        "staff_type": request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type),
+        "approval_status": request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status),
+        "approval_required": request.approval_required,
+        "requested_hours": request.requested_hours,
+        "estimated_cost": request.estimated_cost,
+        "shortage_reason": request.shortage_reason,
+        "requested_by": request.requested_by,
+        "approved_by": request.approved_by,
+        "booked_doctor_name": request.booked_doctor_name,
+        "notes": request.notes,
+    }
+
+
+def _build_grade_mix(doctors: list[Doctor]) -> list[dict]:
+    grade_counts = defaultdict(int)
+    for doctor in doctors:
+        grade_counts[doctor.grade.value if hasattr(doctor.grade, "value") else str(doctor.grade)] += 1
+
+    return [
+        {"grade": grade, "count": grade_counts[grade]}
+        for grade in GRADE_ORDER
+        if grade_counts.get(grade)
+    ]
+
+
+def _build_coverage_pressure(events: list[DoctorAvailabilityEvent], locum_requests: list[LocumRequest]) -> list[dict]:
+    pressure_by_site = defaultdict(lambda: {
+        "active_absences": 0,
+        "zero_days": 0,
+        "teaching_days": 0,
+        "sickness_events": 0,
+        "pending_locums": 0,
+        "estimated_spend": 0.0,
+    })
+    today = date.today()
+
+    for event in events:
+        if event.end_date < today:
+            continue
+        site_summary = pressure_by_site[event.hospital_site]
+        site_summary["active_absences"] += 1
+        if event.event_type == AvailabilityEventType.ZERO_DAY:
+            site_summary["zero_days"] += 1
+        if event.event_type in (AvailabilityEventType.TCPD_DAY, AvailabilityEventType.TEACHING_DAY):
+            site_summary["teaching_days"] += 1
+        if event.event_type == AvailabilityEventType.SICKNESS:
+            site_summary["sickness_events"] += 1
+
+    for request in locum_requests:
+        site_summary = pressure_by_site[request.hospital_site]
+        if request.approval_status in (LocumApprovalStatus.PENDING_APPROVAL, LocumApprovalStatus.APPROVED):
+            site_summary["pending_locums"] += 1
+        site_summary["estimated_spend"] += float(request.estimated_cost or 0)
+
+    rows = []
+    for site, summary in pressure_by_site.items():
+        rows.append({
+            "site": site,
+            **summary,
+            "vacant_shifts": summary["pending_locums"] + summary["sickness_events"],
+            "estimated_spend": round(summary["estimated_spend"], 2),
+        })
+
+    return sorted(rows, key=lambda row: row["site"])
+
+
+def _build_board_entries(
+    doctors_by_id: dict[str, Doctor],
+    latest_schedule: GeneratedSchedule | None,
+    locum_requests: list[LocumRequest],
+    shift_patterns_by_id: dict[str, dict],
+    db: Session,
+) -> list[dict]:
+    today = date.today()
+    window_end = today + timedelta(days=6)
+    assignments = []
+
+    if latest_schedule:
+        assignments = db.query(ScheduleAssignment).filter(
+            ScheduleAssignment.schedule_id == latest_schedule.id,
+            ScheduleAssignment.assignment_date >= today,
+            ScheduleAssignment.assignment_date <= window_end,
+        ).all()
+
+    internal_cover = defaultdict(int)
+    for assignment in assignments:
+        doctor = doctors_by_id.get(assignment.doctor_id)
+        if not doctor:
+            continue
+        internal_cover[(assignment.assignment_date.isoformat(), doctor.hospital_site)] += 1
+
+    entries = []
+    for request in locum_requests:
+        if request.requested_date < today or request.requested_date > window_end:
+            continue
+        shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
+        entries.append({
+            "date": request.requested_date.isoformat(),
+            "hospital_site": request.hospital_site,
+            "ward": request.ward,
+            "department": request.department,
+            "shift_name": shift_pattern.get("name", "Unmapped shift"),
+            "shift_window": shift_pattern.get("shift_window", "TBC"),
+            "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
+            "internal_cover_count": internal_cover[(request.requested_date.isoformat(), request.hospital_site)],
+            "locum_status": request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status),
+            "compliance_level": request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level),
+            "approval_required": request.approval_required,
+            "booked_doctor_name": request.booked_doctor_name,
+            "estimated_cost": request.estimated_cost,
+            "shortage_reason": request.shortage_reason,
+        })
+
+    return sorted(entries, key=lambda item: (item["date"], item["hospital_site"], item["shift_name"]))
+
+
+def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns: list[dict]) -> dict:
+    rules = []
+    for pattern in shift_patterns:
+        rules.append({
+            "shift_code": pattern["code"],
+            "shift_name": pattern["name"],
+            "minimum_grade": pattern["minimum_grade"],
+            "allowed_grades": pattern["eligible_grades"],
+            "compliance_level": pattern["compliance_level"],
+            "approval_required_for_locum": pattern["approval_required"],
+            "booking_rule": "Approval required before attachment" if pattern["approval_required"] else "Can be filled directly from bank pool",
+        })
+
+    approval_queue = []
+    risk_register = []
+    for request in locum_requests:
+        approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
+        if approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
+            approval_queue.append({
+                "id": request.id,
+                "site": request.hospital_site,
+                "ward": request.ward,
+                "requested_date": request.requested_date.isoformat(),
+                "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
+                "compliance_level": request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level),
+                "estimated_cost": request.estimated_cost,
+            })
+
+        if request.compliance_level == ComplianceLevel.CRITICAL or approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
+            risk_register.append({
+                "id": request.id,
+                "severity": "High" if request.compliance_level == ComplianceLevel.CRITICAL else "Medium",
+                "site": request.hospital_site,
+                "title": f"{request.ward} requires {request.required_grade.value if hasattr(request.required_grade, 'value') else str(request.required_grade)} cover",
+                "detail": request.shortage_reason,
+                "recommended_action": "Approve and book locum cover before shift start" if request.approval_required else "Book internal bank cover",
+            })
+
+    return {
+        "grade_rules": rules,
+        "approval_queue": approval_queue,
+        "risk_register": risk_register,
+    }
+
+
+def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: list[LocumRequest]) -> list[dict]:
+    actions = []
+    for site_summary in coverage_pressure:
+        if site_summary["sickness_events"] > 0:
+            actions.append({
+                "title": f"{site_summary['site']}: backfill sickness-related gaps",
+                "detail": f"{site_summary['sickness_events']} sickness events are active across the next rota window.",
+                "impact": "Coverage",
+            })
+        if site_summary["pending_locums"] > 0:
+            actions.append({
+                "title": f"{site_summary['site']}: clear pending locum approvals",
+                "detail": f"{site_summary['pending_locums']} locum requests are still pending or approved but not yet filled.",
+                "impact": "Approvals",
+            })
+
+    if not actions and locum_requests:
+        actions.append({
+            "title": "Coverage is stable",
+            "detail": "Use this window to review grade balance and release bank shifts early to reduce spend.",
+            "impact": "Optimisation",
+        })
+
+    return actions[:4]
+
+
+@router.get("/workspace")
+def get_operations_workspace(db: Session = Depends(get_db)):
+    doctors = db.query(Doctor).all()
+    doctors_by_id = {doctor.id: doctor for doctor in doctors}
+    shift_patterns = [_build_shift_pattern(shift) for shift in db.query(ShiftType).all()]
+    shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
+    events = db.query(DoctorAvailabilityEvent).order_by(DoctorAvailabilityEvent.start_date.asc()).limit(20).all()
+    locum_requests = db.query(LocumRequest).order_by(LocumRequest.requested_date.asc()).all()
+    latest_schedule = db.query(GeneratedSchedule).filter(
+        GeneratedSchedule.generated_successfully == True  # noqa: E712
+    ).order_by(GeneratedSchedule.generated_at.desc()).first()
+
+    coverage_pressure = _build_coverage_pressure(events, locum_requests)
+    active_absences = [event for event in events if event.end_date >= date.today()]
+    pending_shift_swaps = [
+        event for event in active_absences
+        if event.event_type == AvailabilityEventType.SHIFT_SWAP and str(event.status).upper() == "PENDING"
+    ]
+    pending_locum_requests = [
+        request for request in locum_requests
+        if (request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status))
+        == LocumApprovalStatus.PENDING_APPROVAL.value
+    ]
+
+    return {
+        "summary": {
+            "tracked_sites": len({doctor.hospital_site for doctor in doctors}),
+            "doctor_count": len(doctors),
+            "grade_mix": _build_grade_mix(doctors),
+            "active_absence_count": len(active_absences),
+            "pending_shift_swaps": len(pending_shift_swaps),
+            "pending_locum_requests": len(pending_locum_requests),
+            "estimated_weekly_locum_cost": round(sum(float(request.estimated_cost or 0) for request in locum_requests), 2),
+            "latest_schedule_id": latest_schedule.id if latest_schedule else None,
+        },
+        "rota_planning": {
+            "coverage_pressure": coverage_pressure,
+            "grade_distribution": _build_grade_mix(doctors),
+            "recommended_actions": _build_recommended_actions(coverage_pressure, locum_requests),
+            "ward_shortfalls": [
+                {
+                    "site": item["hospital_site"],
+                    "ward": item["ward"],
+                    "department": item["department"],
+                    "shift_name": item["shift_name"],
+                    "required_grade": item["required_grade"],
+                    "approval_status": item["approval_status"],
+                    "estimated_cost": item["estimated_cost"],
+                }
+                for item in [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests]
+            ][:8],
+        },
+        "rota_board": {
+            "window_start": date.today().isoformat(),
+            "window_end": (date.today() + timedelta(days=6)).isoformat(),
+            "generated_from_schedule_id": latest_schedule.id if latest_schedule else None,
+            "entries": _build_board_entries(doctors_by_id, latest_schedule, locum_requests, shift_patterns_by_id, db),
+        },
+        "shift_patterns": shift_patterns,
+        "leave_events": [_serialize_event(event, doctors_by_id) for event in events],
+        "locum_requests": [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests],
+        "compliance": _build_compliance_payload(locum_requests, shift_patterns),
+    }
+
+
+@router.post("/locum-requests/{request_id}/approve")
+def approve_locum_request(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
+    if approval_status == LocumApprovalStatus.FILLED.value:
+        raise HTTPException(status_code=400, detail="Filled requests do not need approval")
+
+    approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
+    locum_request.approval_status = LocumApprovalStatus.APPROVED
+    locum_request.approved_by = approved_by
+    db.commit()
+
+    return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.APPROVED.value}
+
+
+@router.post("/locum-requests/{request_id}/book")
+def book_locum_request(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
+    if locum_request.approval_required and approval_status != LocumApprovalStatus.APPROVED.value:
+        raise HTTPException(status_code=400, detail="Request must be approved before a bank or agency doctor can be attached")
+
+    booked_name = (body or {}).get("booked_doctor_name", "Bank Staff Pool")
+    locum_request.booked_doctor_name = booked_name
+    locum_request.approval_status = LocumApprovalStatus.FILLED
+    if not locum_request.approved_by:
+        locum_request.approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
+    db.commit()
+
+    return {"status": "success", "request_id": request_id, "approval_status": LocumApprovalStatus.FILLED.value}
