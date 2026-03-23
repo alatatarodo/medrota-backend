@@ -256,6 +256,9 @@ class DoctorAvailabilityEvent(Base):
     status = Column(String(30), default="APPROVED")
     reason_category = Column(String(100))
     related_doctor_id = Column(String(36), ForeignKey("doctors.id"))
+    approved_by = Column(String(100))
+    approved_at = Column(DateTime)
+    approval_comment = Column(Text)
     notes = Column(Text)
     created_at = Column(DateTime, default=func.now())
 
@@ -285,6 +288,8 @@ class LocumRequest(Base):
     shortage_reason = Column(String(255))
     requested_by = Column(String(100))
     approved_by = Column(String(100))
+    approved_at = Column(DateTime)
+    approval_comment = Column(Text)
     booked_doctor_name = Column(String(100))
     notes = Column(Text)
     created_at = Column(DateTime, default=func.now())

@@ -248,6 +248,9 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
         "reason_category": event.reason_category,
         "related_doctor_id": event.related_doctor_id,
         "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
+        "approved_by": event.approved_by,
+        "approved_at": event.approved_at.isoformat() if event.approved_at else None,
+        "approval_comment": event.approval_comment,
         "notes": event.notes,
     }
 
@@ -274,6 +277,8 @@ def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[s
         "shortage_reason": request.shortage_reason,
         "requested_by": request.requested_by,
         "approved_by": request.approved_by,
+        "approved_at": request.approved_at.isoformat() if request.approved_at else None,
+        "approval_comment": request.approval_comment,
         "booked_doctor_name": request.booked_doctor_name,
         "notes": request.notes,
         **governance,
@@ -742,6 +747,10 @@ def update_availability_event(event_id: str, payload: AvailabilityEventUpdate, d
     event.status = payload.status
     event.reason_category = payload.reason_category
     event.related_doctor_id = payload.related_doctor_id
+    if payload.status != "APPROVED":
+        event.approved_by = None
+        event.approved_at = None
+        event.approval_comment = None
     event.notes = payload.notes
     _record_audit_event(
         db,
@@ -837,6 +846,8 @@ def update_locum_request(request_id: str, payload: LocumRequestUpdate, db: Sessi
     )
     if locum_request.approval_status == LocumApprovalStatus.PENDING_APPROVAL:
         locum_request.approved_by = None
+        locum_request.approved_at = None
+        locum_request.approval_comment = None
 
     _record_audit_event(
         db,
@@ -866,8 +877,11 @@ def approve_locum_request(request_id: str, body: dict | None = None, db: Session
         raise HTTPException(status_code=400, detail="Filled requests do not need approval")
 
     approved_by = (body or {}).get("approved_by", "Medical Staffing Lead")
+    approval_comment = (body or {}).get("comment")
     locum_request.approval_status = LocumApprovalStatus.APPROVED
     locum_request.approved_by = approved_by
+    locum_request.approved_at = datetime.utcnow()
+    locum_request.approval_comment = approval_comment
     _record_audit_event(
         db,
         entity_type="locum_request",
@@ -876,7 +890,7 @@ def approve_locum_request(request_id: str, body: dict | None = None, db: Session
         hospital_site=locum_request.hospital_site,
         actor_name=approved_by,
         summary=f"Locum request approved for {locum_request.ward}",
-        detail=locum_request.shortage_reason,
+        detail=approval_comment or locum_request.shortage_reason,
     )
     db.commit()
 
@@ -923,18 +937,24 @@ def update_availability_event_status(event_id: str, body: dict | None = None, db
 
     event.status = requested_status
     note = (body or {}).get("note")
+    approved_by = (body or {}).get("approved_by")
+    comment = (body or {}).get("comment")
     if note:
         existing_notes = event.notes or ""
         event.notes = f"{existing_notes}\nStatus update: {note}".strip()
+    if requested_status == "APPROVED":
+        event.approved_by = approved_by or event.approved_by or "Rota Coordinator"
+        event.approved_at = datetime.utcnow()
+        event.approval_comment = comment or note or event.approval_comment
     _record_audit_event(
         db,
         entity_type="availability_event",
         entity_id=event.id,
         action=f"STATUS_{requested_status}",
         hospital_site=event.hospital_site,
-        actor_name="Operations Workspace",
+        actor_name=approved_by or "Operations Workspace",
         summary=f"Availability event moved to {requested_status}",
-        detail=note,
+        detail=comment or note,
     )
     db.commit()
 

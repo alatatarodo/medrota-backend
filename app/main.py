@@ -14,6 +14,8 @@ def ensure_schema_updates():
     """Apply lightweight schema updates for environments without migrations."""
     inspector = inspect(engine)
     doctor_columns = {column["name"] for column in inspector.get_columns("doctors")}
+    availability_columns = {column["name"] for column in inspector.get_columns("doctor_availability_events")}
+    locum_columns = {column["name"] for column in inspector.get_columns("locum_requests")}
 
     if "hospital_site" not in doctor_columns:
         with engine.begin() as connection:
@@ -24,6 +26,19 @@ def ensure_schema_updates():
                     "NOT NULL DEFAULT 'Wythenshawe Hospital'"
                 )
             )
+
+    with engine.begin() as connection:
+        if "approved_by" not in availability_columns:
+            connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approved_by VARCHAR(100)"))
+        if "approved_at" not in availability_columns:
+            connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approved_at DATETIME"))
+        if "approval_comment" not in availability_columns:
+            connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approval_comment TEXT"))
+
+        if "approved_at" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approved_at DATETIME"))
+        if "approval_comment" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approval_comment TEXT"))
 
 
 ensure_schema_updates()
