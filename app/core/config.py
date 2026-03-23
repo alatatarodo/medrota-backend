@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     api_description: str = "Automated rostering system for NHS doctors"
     
     # CORS
-    allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    allowed_origins: str = "http://localhost:3000,http://localhost:5173"
     
     # Scheduler
     scheduler_timeout_seconds: int = 300
@@ -34,21 +34,6 @@ class Settings(BaseSettings):
     
     # Redis (for async jobs)
     redis_url: str = "redis://localhost:6379/0"
-
-    @field_validator("allowed_origins", mode="before")
-    @classmethod
-    def parse_allowed_origins(cls, value):
-        if isinstance(value, str):
-            trimmed = value.strip()
-            if not trimmed:
-                return []
-
-            if trimmed.startswith("["):
-                return json.loads(trimmed)
-
-            return [origin.strip() for origin in trimmed.split(",") if origin.strip()]
-
-        return value
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -73,6 +58,26 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        value = self.allowed_origins
+
+        if isinstance(value, list):
+            return value
+
+        if not isinstance(value, str):
+            return []
+
+        trimmed = value.strip()
+        if not trimmed:
+            return []
+
+        if trimmed.startswith("["):
+            parsed = json.loads(trimmed)
+            return [str(origin).strip() for origin in parsed if str(origin).strip()]
+
+        return [origin.strip() for origin in trimmed.split(",") if origin.strip()]
 
 
 settings = Settings()
