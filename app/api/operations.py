@@ -82,6 +82,33 @@ STAFF_MULTIPLIERS = {
     "AGENCY": 1.25,
 }
 
+APPROVAL_ROLE_LEVELS = {
+    "Service Manager": 1,
+    "Medical Staffing Lead": 2,
+    "Clinical Director": 3,
+    "Chief of Service": 4,
+}
+
+ROLE_BY_LEVEL = {level: role for role, level in APPROVAL_ROLE_LEVELS.items()}
+
+APPROVAL_GOVERNANCE_BASE = {
+    ComplianceLevel.STANDARD.value: {
+        "tier": "Tier 1",
+        "approver": "Service Manager",
+        "spend_cap": 650.0,
+    },
+    ComplianceLevel.ENHANCED.value: {
+        "tier": "Tier 2",
+        "approver": "Medical Staffing Lead",
+        "spend_cap": 900.0,
+    },
+    ComplianceLevel.CRITICAL.value: {
+        "tier": "Tier 3",
+        "approver": "Clinical Director",
+        "spend_cap": 1250.0,
+    },
+}
+
 
 def _grade_value(grade: str) -> int:
     try:
@@ -110,6 +137,68 @@ def _estimate_locum_cost(required_grade: DoctorGrade, staff_type, requested_hour
     base_rate = GRADE_RATE_CARD.get(grade_key, 50)
     multiplier = STAFF_MULTIPLIERS.get(staff_key, 1.0)
     return round(base_rate * multiplier * requested_hours, 2)
+
+
+def _higher_approver(current_role: str, candidate_role: str) -> str:
+    current_level = APPROVAL_ROLE_LEVELS.get(current_role, 0)
+    candidate_level = APPROVAL_ROLE_LEVELS.get(candidate_role, 0)
+    return ROLE_BY_LEVEL.get(max(current_level, candidate_level), candidate_role if candidate_level >= current_level else current_role)
+
+
+def _build_locum_governance(request: LocumRequest, shift_pattern: dict) -> dict:
+    grade_key = request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade)
+    compliance_key = request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level)
+    staff_key = request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type)
+    cost = float(request.estimated_cost or 0)
+
+    baseline = APPROVAL_GOVERNANCE_BASE.get(compliance_key, APPROVAL_GOVERNANCE_BASE[ComplianceLevel.STANDARD.value])
+    recommended_approver = baseline["approver"]
+    approval_tier = baseline["tier"]
+    spend_cap = baseline["spend_cap"]
+    guidance_notes = []
+
+    if _grade_value(grade_key) >= _grade_value("Registrar"):
+        recommended_approver = _higher_approver(recommended_approver, "Clinical Director")
+        approval_tier = "Tier 3"
+        spend_cap = max(spend_cap, 1250.0)
+        guidance_notes.append("Registrar-and-above cover requires senior sign-off.")
+
+    if grade_key == DoctorGrade.CONSULTANT.value:
+        recommended_approver = _higher_approver(recommended_approver, "Chief of Service")
+        approval_tier = "Tier 4"
+        spend_cap = max(spend_cap, 1800.0)
+        guidance_notes.append("Consultant locums require executive-level approval.")
+
+    if staff_key == "AGENCY":
+        recommended_approver = _higher_approver(recommended_approver, "Clinical Director")
+        approval_tier = "Tier 3" if approval_tier in {"Tier 1", "Tier 2"} else approval_tier
+        spend_cap = max(spend_cap, 950.0)
+        guidance_notes.append("Agency usage should include finance visibility.")
+
+    if shift_pattern.get("is_on_call") or shift_pattern.get("is_night_shift"):
+        recommended_approver = _higher_approver(recommended_approver, "Medical Staffing Lead")
+        spend_cap = max(spend_cap, 900.0)
+        guidance_notes.append("Out-of-hours cover should be reviewed against escalation policy.")
+
+    requires_finance_signoff = staff_key == "AGENCY" or cost > spend_cap
+    spend_cap_status = "OVER_CAP" if cost > spend_cap else "WITHIN_CAP"
+
+    if cost > spend_cap:
+        guidance_notes.append(f"Estimated cost exceeds the policy cap of GBP {spend_cap:,.0f}.")
+    elif cost > spend_cap * 0.8:
+        guidance_notes.append("Estimated cost is approaching the approval cap.")
+
+    if not guidance_notes:
+        guidance_notes.append("Request sits within the standard governance pathway.")
+
+    return {
+        "approval_tier": approval_tier,
+        "recommended_approver": recommended_approver,
+        "spend_cap": spend_cap,
+        "spend_cap_status": spend_cap_status,
+        "requires_finance_signoff": requires_finance_signoff,
+        "governance_note": " ".join(guidance_notes),
+    }
 
 
 def _build_shift_pattern(shift: ShiftType) -> dict:
@@ -163,6 +252,7 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
 
 def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[str, dict]) -> dict:
     shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
+    governance = _build_locum_governance(request, shift_pattern)
     return {
         "id": request.id,
         "hospital_site": request.hospital_site,
@@ -184,6 +274,7 @@ def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[s
         "approved_by": request.approved_by,
         "booked_doctor_name": request.booked_doctor_name,
         "notes": request.notes,
+        **governance,
     }
 
 
@@ -297,6 +388,7 @@ def _build_board_entries(
 
 
 def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns: list[dict]) -> dict:
+    shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
     rules = []
     for pattern in shift_patterns:
         rules.append({
@@ -315,6 +407,8 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
         approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
         if approval_status == LocumApprovalStatus.DECLINED.value:
             continue
+        shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
+        governance = _build_locum_governance(request, shift_pattern)
         if approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
             approval_queue.append({
                 "id": request.id,
@@ -324,16 +418,20 @@ def _build_compliance_payload(locum_requests: list[LocumRequest], shift_patterns
                 "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
                 "compliance_level": request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level),
                 "estimated_cost": request.estimated_cost,
+                "recommended_approver": governance["recommended_approver"],
+                "approval_tier": governance["approval_tier"],
+                "spend_cap_status": governance["spend_cap_status"],
+                "requires_finance_signoff": governance["requires_finance_signoff"],
             })
 
-        if request.compliance_level == ComplianceLevel.CRITICAL or approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
+        if request.compliance_level == ComplianceLevel.CRITICAL or approval_status == LocumApprovalStatus.PENDING_APPROVAL.value or governance["spend_cap_status"] == "OVER_CAP":
             risk_register.append({
                 "id": request.id,
-                "severity": "High" if request.compliance_level == ComplianceLevel.CRITICAL else "Medium",
+                "severity": "High" if request.compliance_level == ComplianceLevel.CRITICAL or governance["spend_cap_status"] == "OVER_CAP" else "Medium",
                 "site": request.hospital_site,
                 "title": f"{request.ward} requires {request.required_grade.value if hasattr(request.required_grade, 'value') else str(request.required_grade)} cover",
-                "detail": request.shortage_reason,
-                "recommended_action": "Approve and book locum cover before shift start" if request.approval_required else "Book internal bank cover",
+                "detail": governance["governance_note"],
+                "recommended_action": f"Route to {governance['recommended_approver']} and secure cover before shift start" if request.approval_required else "Book internal bank cover",
             })
 
     return {
