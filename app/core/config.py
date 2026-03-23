@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # Redis (for async jobs)
     redis_url: str = "redis://localhost:6379/0"
 
+    # OpenAI Copilot
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_timeout_seconds: float = 30.0
+
     @field_validator("database_url", mode="before")
     @classmethod
     def parse_database_url(cls, value, info: ValidationInfo):

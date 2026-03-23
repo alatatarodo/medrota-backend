@@ -1,6 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 from app.db.models import (
     AvailabilityEventType,
     ComplianceLevel,
@@ -235,3 +235,34 @@ class LocumRequestCreate(BaseModel):
 
 class LocumRequestUpdate(LocumRequestCreate):
     pass
+
+
+class CopilotQuickAction(BaseModel):
+    label: str
+    action_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class CopilotStatusResponse(BaseModel):
+    configured: bool
+    mode: str
+    model: str
+    starter_prompts: List[str]
+    guardrails: List[str]
+
+
+class CopilotQueryRequest(BaseModel):
+    message: str = Field(min_length=2, max_length=3000)
+    active_module: Optional[str] = None
+    hospital_site: Optional[str] = None
+    schedule_id: Optional[str] = None
+
+
+class CopilotQueryResponse(BaseModel):
+    mode: str
+    configured: bool
+    headline: str
+    answer: str
+    risk_level: str
+    quick_actions: List[CopilotQuickAction] = Field(default_factory=list)
+    follow_up_questions: List[str] = Field(default_factory=list)

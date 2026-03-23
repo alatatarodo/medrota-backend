@@ -705,8 +705,7 @@ def _resolve_shift_or_404(shift_code: str, db: Session) -> ShiftType:
     return shift
 
 
-@router.get("/workspace")
-def get_operations_workspace(db: Session = Depends(get_db)):
+def build_operations_workspace_payload(db: Session) -> dict:
     doctors = db.query(Doctor).all()
     doctors_by_id = {doctor.id: doctor for doctor in doctors}
     shift_patterns = [_build_shift_pattern(shift) for shift in db.query(ShiftType).all()]
@@ -782,6 +781,11 @@ def get_operations_workspace(db: Session = Depends(get_db)):
             "availability_statuses": ["APPROVED", "PENDING", "RECORDED", "CANCELLED"],
         },
     }
+
+
+@router.get("/workspace")
+def get_operations_workspace(db: Session = Depends(get_db)):
+    return build_operations_workspace_payload(db)
 
 
 @router.post("/availability-events", status_code=201)
