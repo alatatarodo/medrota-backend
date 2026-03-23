@@ -279,10 +279,30 @@ def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[s
         "approved_by": request.approved_by,
         "approved_at": request.approved_at.isoformat() if request.approved_at else None,
         "approval_comment": request.approval_comment,
+        "finance_approval_status": request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED"),
+        "finance_approved_by": request.finance_approved_by,
+        "finance_approved_at": request.finance_approved_at.isoformat() if request.finance_approved_at else None,
+        "finance_approval_comment": request.finance_approval_comment,
         "booked_doctor_name": request.booked_doctor_name,
         "notes": request.notes,
         **governance,
     }
+
+
+def _sync_finance_approval_state(request: LocumRequest, shift_pattern: dict) -> None:
+    governance = _build_locum_governance(request, shift_pattern)
+    if governance["requires_finance_signoff"]:
+        current_status = (request.finance_approval_status or "").upper().strip()
+        request.finance_approval_status = current_status if current_status in {"APPROVED", "DECLINED"} else "PENDING"
+        if request.finance_approval_status != "APPROVED":
+            request.finance_approved_by = None
+            request.finance_approved_at = None
+            request.finance_approval_comment = None
+    else:
+        request.finance_approval_status = "NOT_REQUIRED"
+        request.finance_approved_by = None
+        request.finance_approved_at = None
+        request.finance_approval_comment = None
 
 
 def _build_grade_mix(doctors: list[Doctor]) -> list[dict]:
@@ -420,6 +440,7 @@ def _build_compliance_payload(
         })
 
     approval_queue = []
+    finance_queue = []
     shift_swap_queue = []
     escalation_flags = []
     risk_register = []
@@ -479,6 +500,29 @@ def _build_compliance_payload(
             overdue_items += 1 if aging_status == "OVERDUE" else 0
             finance_signoffs += 1 if governance["requires_finance_signoff"] else 0
 
+        finance_status = (request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED")).upper()
+        if governance["requires_finance_signoff"] and finance_status != "APPROVED":
+            finance_queue.append({
+                "id": request.id,
+                "site": request.hospital_site,
+                "ward": request.ward,
+                "requested_date": request.requested_date.isoformat(),
+                "required_grade": request.required_grade.value if hasattr(request.required_grade, "value") else str(request.required_grade),
+                "compliance_level": request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level),
+                "estimated_cost": request.estimated_cost,
+                "staff_type": request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type),
+                "recommended_approver": "Finance Business Partner",
+                "approval_tier": governance["approval_tier"],
+                "finance_approval_status": finance_status,
+                "spend_cap_status": governance["spend_cap_status"],
+                "age_days": _approval_age_days(request.created_at),
+                "age_hours": _approval_age_hours(request.created_at),
+                "aging_status": _approval_aging_status(_approval_age_days(request.created_at)),
+                "finance_approved_by": request.finance_approved_by,
+                "finance_approved_at": request.finance_approved_at.isoformat() if request.finance_approved_at else None,
+                "finance_approval_comment": request.finance_approval_comment,
+            })
+
         if request.compliance_level == ComplianceLevel.CRITICAL or approval_status == LocumApprovalStatus.PENDING_APPROVAL.value or governance["spend_cap_status"] == "OVER_CAP":
             risk_register.append({
                 "id": request.id,
@@ -534,9 +578,11 @@ def _build_compliance_payload(
     return {
         "grade_rules": rules,
         "approval_queue": approval_queue,
+        "finance_queue": finance_queue,
         "shift_swap_queue": shift_swap_queue,
         "approval_overview": {
             "pending_locum_approvals": len(approval_queue),
+            "pending_finance_reviews": len(finance_queue),
             "pending_shift_swaps": len(shift_swap_queue),
             "overdue_items": overdue_items,
             "finance_signoffs": finance_signoffs,
@@ -891,6 +937,7 @@ def create_locum_request(payload: LocumRequestCreate, db: Session = Depends(get_
         requested_by=payload.requested_by,
         notes=payload.notes,
     )
+    _sync_finance_approval_state(locum_request, _build_shift_pattern(shift))
     db.add(locum_request)
     _record_audit_event(
         db,
@@ -942,6 +989,7 @@ def update_locum_request(request_id: str, payload: LocumRequestUpdate, db: Sessi
         locum_request.approved_by = None
         locum_request.approved_at = None
         locum_request.approval_comment = None
+    _sync_finance_approval_state(locum_request, _build_shift_pattern(shift))
 
     _record_audit_event(
         db,
@@ -1026,6 +1074,80 @@ def reject_locum_request(request_id: str, body: dict | None = None, db: Session 
 
     shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
     shift_pattern = _build_shift_pattern(shift) if shift else {}
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern} if shift else {})
+
+
+@router.post("/locum-requests/{request_id}/finance-approve")
+def approve_finance_signoff(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
+    shift_pattern = _build_shift_pattern(shift) if shift else {}
+    governance = _build_locum_governance(locum_request, shift_pattern)
+    if not governance["requires_finance_signoff"]:
+        raise HTTPException(status_code=400, detail="This request does not need finance sign-off")
+
+    approved_by = (body or {}).get("approved_by", "Finance Business Partner")
+    comment = (body or {}).get("comment")
+    locum_request.finance_approval_status = "APPROVED"
+    locum_request.finance_approved_by = approved_by
+    locum_request.finance_approved_at = datetime.utcnow()
+    locum_request.finance_approval_comment = comment
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="FINANCE_APPROVED",
+        hospital_site=locum_request.hospital_site,
+        actor_name=approved_by,
+        summary=f"Finance sign-off approved for {locum_request.ward}",
+        detail=comment or locum_request.shortage_reason,
+    )
+    db.commit()
+    db.refresh(locum_request)
+
+    return _serialize_locum_request(locum_request, {shift.id: shift_pattern} if shift else {})
+
+
+@router.post("/locum-requests/{request_id}/finance-reject")
+def reject_finance_signoff(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
+    if not locum_request:
+        raise HTTPException(status_code=404, detail="Locum request not found")
+
+    shift = db.query(ShiftType).filter(ShiftType.id == locum_request.shift_type_id).first()
+    shift_pattern = _build_shift_pattern(shift) if shift else {}
+    governance = _build_locum_governance(locum_request, shift_pattern)
+    if not governance["requires_finance_signoff"]:
+        raise HTTPException(status_code=400, detail="This request does not need finance sign-off")
+
+    reason = str((body or {}).get("reason", "")).strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A finance rejection reason is required")
+
+    approved_by = (body or {}).get("approved_by", "Finance Business Partner")
+    locum_request.finance_approval_status = "DECLINED"
+    locum_request.finance_approved_by = approved_by
+    locum_request.finance_approved_at = datetime.utcnow()
+    locum_request.finance_approval_comment = reason
+    locum_request.approval_status = LocumApprovalStatus.DECLINED
+    existing_notes = locum_request.notes or ""
+    locum_request.notes = f"{existing_notes}\nFinance rejected: {reason}".strip()
+    _record_audit_event(
+        db,
+        entity_type="locum_request",
+        entity_id=locum_request.id,
+        action="FINANCE_REJECTED",
+        hospital_site=locum_request.hospital_site,
+        actor_name=approved_by,
+        summary=f"Finance sign-off rejected for {locum_request.ward}",
+        detail=reason,
+    )
+    db.commit()
+    db.refresh(locum_request)
+
     return _serialize_locum_request(locum_request, {shift.id: shift_pattern} if shift else {})
 
 
@@ -1168,6 +1290,10 @@ def book_locum_request(request_id: str, body: dict | None = None, db: Session = 
     approval_status = locum_request.approval_status.value if hasattr(locum_request.approval_status, "value") else str(locum_request.approval_status)
     if locum_request.approval_required and approval_status != LocumApprovalStatus.APPROVED.value:
         raise HTTPException(status_code=400, detail="Request must be approved before a bank or agency doctor can be attached")
+    if (locum_request.finance_approval_status or "").upper() == "PENDING":
+        raise HTTPException(status_code=400, detail="Finance sign-off must be completed before a bank or agency doctor can be attached")
+    if (locum_request.finance_approval_status or "").upper() == "DECLINED":
+        raise HTTPException(status_code=400, detail="Finance has declined this request and it cannot be booked")
 
     booked_name = (body or {}).get("booked_doctor_name", "Bank Staff Pool")
     locum_request.booked_doctor_name = booked_name

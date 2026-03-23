@@ -39,6 +39,14 @@ def ensure_schema_updates():
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approved_at DATETIME"))
         if "approval_comment" not in locum_columns:
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approval_comment TEXT"))
+        if "finance_approval_status" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approval_status VARCHAR(30) DEFAULT 'NOT_REQUIRED'"))
+        if "finance_approved_by" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approved_by VARCHAR(100)"))
+        if "finance_approved_at" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approved_at DATETIME"))
+        if "finance_approval_comment" not in locum_columns:
+            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approval_comment TEXT"))
 
 
 ensure_schema_updates()
