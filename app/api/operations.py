@@ -421,10 +421,13 @@ def _build_compliance_payload(
 
     approval_queue = []
     shift_swap_queue = []
+    escalation_flags = []
     risk_register = []
     approver_workloads = defaultdict(lambda: {"approver": "", "pending_items": 0, "overdue_items": 0, "finance_signoffs": 0})
     overdue_items = 0
     finance_signoffs = 0
+    breached_items = 0
+    at_risk_items = 0
     for request in locum_requests:
         approval_status = request.approval_status.value if hasattr(request.approval_status, "value") else str(request.approval_status)
         if approval_status == LocumApprovalStatus.DECLINED.value:
@@ -433,7 +436,19 @@ def _build_compliance_payload(
         governance = _build_locum_governance(request, shift_pattern)
         if approval_status == LocumApprovalStatus.PENDING_APPROVAL.value:
             age_days = _approval_age_days(request.created_at)
+            age_hours = _approval_age_hours(request.created_at)
             aging_status = _approval_aging_status(age_days)
+            sla_hours = _locum_sla_hours(request.compliance_level.value if hasattr(request.compliance_level, "value") else str(request.compliance_level))
+            escalation_flag = _build_escalation_flag(
+                queue_type="LOCUM",
+                site=request.hospital_site,
+                title=f"{request.ward} {request.required_grade.value if hasattr(request.required_grade, 'value') else str(request.required_grade)} approval",
+                recommended_approver=governance["recommended_approver"],
+                age_hours=age_hours,
+                sla_hours=sla_hours,
+                detail=request.shortage_reason,
+                finance_signoff=governance["requires_finance_signoff"],
+            )
             approval_queue.append({
                 "id": request.id,
                 "queue_type": "LOCUM",
@@ -448,8 +463,15 @@ def _build_compliance_payload(
                 "spend_cap_status": governance["spend_cap_status"],
                 "requires_finance_signoff": governance["requires_finance_signoff"],
                 "age_days": age_days,
+                "age_hours": age_hours,
                 "aging_status": aging_status,
+                "sla_hours": sla_hours,
+                "hours_remaining": sla_hours - age_hours,
             })
+            if escalation_flag:
+                escalation_flags.append(escalation_flag)
+                breached_items += 1 if escalation_flag["status"] == "BREACHED" else 0
+                at_risk_items += 1 if escalation_flag["status"] == "AT_RISK" else 0
             approver_workloads[governance["recommended_approver"]]["approver"] = governance["recommended_approver"]
             approver_workloads[governance["recommended_approver"]]["pending_items"] += 1
             approver_workloads[governance["recommended_approver"]]["overdue_items"] += 1 if aging_status == "OVERDUE" else 0
@@ -473,7 +495,18 @@ def _build_compliance_payload(
         doctor = doctors_by_id.get(event.doctor_id)
         related_doctor = doctors_by_id.get(event.related_doctor_id) if event.related_doctor_id else None
         age_days = _approval_age_days(event.created_at)
+        age_hours = _approval_age_hours(event.created_at)
         aging_status = _approval_aging_status(age_days)
+        sla_hours = 12
+        escalation_flag = _build_escalation_flag(
+            queue_type="SHIFT_SWAP",
+            site=event.hospital_site,
+            title=f"Shift swap for {doctor.first_name} {doctor.last_name}" if doctor else f"Shift swap for {event.doctor_id}",
+            recommended_approver="Rota Coordinator",
+            age_hours=age_hours,
+            sla_hours=sla_hours,
+            detail=event.reason_category or "Pending shift swap approval",
+        )
         shift_swap_queue.append({
             "id": event.id,
             "queue_type": "SHIFT_SWAP",
@@ -483,9 +516,16 @@ def _build_compliance_payload(
             "shift_date": event.start_date.isoformat(),
             "session_label": event.session_label,
             "age_days": age_days,
+            "age_hours": age_hours,
             "aging_status": aging_status,
             "recommended_approver": "Rota Coordinator",
+            "sla_hours": sla_hours,
+            "hours_remaining": sla_hours - age_hours,
         })
+        if escalation_flag:
+            escalation_flags.append(escalation_flag)
+            breached_items += 1 if escalation_flag["status"] == "BREACHED" else 0
+            at_risk_items += 1 if escalation_flag["status"] == "AT_RISK" else 0
         approver_workloads["Rota Coordinator"]["approver"] = "Rota Coordinator"
         approver_workloads["Rota Coordinator"]["pending_items"] += 1
         approver_workloads["Rota Coordinator"]["overdue_items"] += 1 if aging_status == "OVERDUE" else 0
@@ -500,7 +540,10 @@ def _build_compliance_payload(
             "pending_shift_swaps": len(shift_swap_queue),
             "overdue_items": overdue_items,
             "finance_signoffs": finance_signoffs,
+            "breached_items": breached_items,
+            "at_risk_items": at_risk_items,
         },
+        "escalation_flags": sorted(escalation_flags, key=lambda item: (0 if item["status"] == "BREACHED" else 1, item["hours_remaining"])),
         "approver_workloads": sorted(approver_workloads.values(), key=lambda item: (-item["pending_items"], item["approver"])),
         "risk_register": risk_register,
     }
@@ -545,6 +588,53 @@ def _approval_aging_status(age_days: int) -> str:
     if age_days >= 1:
         return "DUE_SOON"
     return "NEW"
+
+
+def _approval_age_hours(created_at) -> int:
+    if not created_at:
+        return 0
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at)
+        except ValueError:
+            return 0
+    if not isinstance(created_at, datetime):
+        return 0
+    return max(int((datetime.utcnow() - created_at).total_seconds() // 3600), 0)
+
+
+def _locum_sla_hours(compliance_level: str) -> int:
+    if compliance_level == ComplianceLevel.CRITICAL.value:
+        return 4
+    if compliance_level == ComplianceLevel.ENHANCED.value:
+        return 12
+    return 24
+
+
+def _build_escalation_flag(*, queue_type: str, site: str, title: str, recommended_approver: str, age_hours: int, sla_hours: int, detail: str, finance_signoff: bool = False) -> dict | None:
+    hours_remaining = sla_hours - age_hours
+    if age_hours >= sla_hours:
+        status = "BREACHED"
+        escalate_to = "Chief of Service" if finance_signoff else "Clinical Director"
+    elif hours_remaining <= max(2, sla_hours // 4):
+        status = "AT_RISK"
+        escalate_to = "Medical Staffing Lead" if recommended_approver != "Chief of Service" else "Chief of Service"
+    else:
+        return None
+
+    return {
+        "queue_type": queue_type,
+        "site": site,
+        "title": title,
+        "recommended_approver": recommended_approver,
+        "escalate_to": escalate_to,
+        "age_hours": age_hours,
+        "sla_hours": sla_hours,
+        "hours_remaining": hours_remaining,
+        "status": status,
+        "detail": detail,
+        "finance_signoff": finance_signoff,
+    }
 
 
 def _record_audit_event(
