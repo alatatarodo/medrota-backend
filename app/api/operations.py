@@ -560,6 +560,28 @@ def cancel_availability_event(event_id: str, body: dict | None = None, db: Sessi
     return _serialize_event(event, {doctor.id: doctor for doctor in doctors})
 
 
+@router.post("/availability-events/{event_id}/status")
+def update_availability_event_status(event_id: str, body: dict | None = None, db: Session = Depends(get_db)):
+    event = db.query(DoctorAvailabilityEvent).filter(DoctorAvailabilityEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Availability event not found")
+
+    requested_status = str((body or {}).get("status", "")).upper().strip()
+    allowed_statuses = {"APPROVED", "PENDING", "RECORDED"}
+    if requested_status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Unsupported availability status")
+
+    event.status = requested_status
+    note = (body or {}).get("note")
+    if note:
+        existing_notes = event.notes or ""
+        event.notes = f"{existing_notes}\nStatus update: {note}".strip()
+    db.commit()
+
+    doctors = db.query(Doctor).filter(Doctor.id.in_([doctor_id for doctor_id in [event.doctor_id, event.related_doctor_id] if doctor_id])).all()
+    return _serialize_event(event, {doctor.id: doctor for doctor in doctors})
+
+
 @router.post("/locum-requests/{request_id}/cancel")
 def cancel_locum_request(request_id: str, body: dict | None = None, db: Session = Depends(get_db)):
     locum_request = db.query(LocumRequest).filter(LocumRequest.id == request_id).first()
