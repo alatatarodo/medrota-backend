@@ -140,6 +140,15 @@ def _estimate_locum_cost(required_grade: DoctorGrade, staff_type, requested_hour
     return round(base_rate * multiplier * requested_hours, 2)
 
 
+def _format_doctor_name(doctor: Doctor | None) -> str:
+    if not doctor:
+        return "Unknown"
+    title = (doctor.title or "Dr").strip()
+    preferred = (doctor.preferred_name or doctor.first_name or "").strip()
+    surname = (doctor.last_name or "").strip()
+    return " ".join(part for part in [title, preferred, surname] if part)
+
+
 def _higher_approver(current_role: str, candidate_role: str) -> str:
     current_level = APPROVAL_ROLE_LEVELS.get(current_role, 0)
     candidate_level = APPROVAL_ROLE_LEVELS.get(candidate_role, 0)
@@ -236,7 +245,7 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
     return {
         "id": event.id,
         "doctor_id": event.doctor_id,
-        "doctor_name": f"{doctor.first_name} {doctor.last_name}" if doctor else "Unknown",
+        "doctor_name": _format_doctor_name(doctor),
         "doctor_grade": doctor.grade.value if doctor and hasattr(doctor.grade, "value") else str(doctor.grade) if doctor else "Unknown",
         "hospital_site": event.hospital_site,
         "event_type": event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
@@ -247,7 +256,7 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
         "status": event.status,
         "reason_category": event.reason_category,
         "related_doctor_id": event.related_doctor_id,
-        "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
+        "related_doctor_name": _format_doctor_name(related_doctor) if related_doctor else None,
         "approved_by": event.approved_by,
         "approved_at": event.approved_at.isoformat() if event.approved_at else None,
         "approval_comment": event.approval_comment,
@@ -558,7 +567,7 @@ def _build_compliance_payload(
         escalation_flag = _build_escalation_flag(
             queue_type="SHIFT_SWAP",
             site=event.hospital_site,
-            title=f"Shift swap for {doctor.first_name} {doctor.last_name}" if doctor else f"Shift swap for {event.doctor_id}",
+            title=f"Shift swap for {_format_doctor_name(doctor)}" if doctor else f"Shift swap for {event.doctor_id}",
             recommended_approver="Rota Coordinator",
             age_hours=age_hours,
             sla_hours=sla_hours,
@@ -568,8 +577,8 @@ def _build_compliance_payload(
             "id": event.id,
             "queue_type": "SHIFT_SWAP",
             "site": event.hospital_site,
-            "doctor_name": f"{doctor.first_name} {doctor.last_name}" if doctor else event.doctor_id,
-            "related_doctor_name": f"{related_doctor.first_name} {related_doctor.last_name}" if related_doctor else None,
+            "doctor_name": _format_doctor_name(doctor) if doctor else event.doctor_id,
+            "related_doctor_name": _format_doctor_name(related_doctor) if related_doctor else None,
             "shift_date": event.start_date.isoformat(),
             "session_label": event.session_label,
             "age_days": age_days,
@@ -872,7 +881,7 @@ def create_availability_event(payload: AvailabilityEventCreate, db: Session = De
         action="CREATED",
         hospital_site=doctor.hospital_site,
         actor_name="Operations Workspace",
-        summary=f"{EVENT_LABELS.get(payload.event_type, payload.event_type.value)} created for {doctor.first_name} {doctor.last_name}",
+        summary=f"{EVENT_LABELS.get(payload.event_type, payload.event_type.value)} created for {_format_doctor_name(doctor)}",
         detail=payload.notes,
     )
     db.commit()
@@ -912,7 +921,7 @@ def update_availability_event(event_id: str, payload: AvailabilityEventUpdate, d
         action="UPDATED",
         hospital_site=doctor.hospital_site,
         actor_name="Operations Workspace",
-        summary=f"Availability event updated for {doctor.first_name} {doctor.last_name}",
+        summary=f"Availability event updated for {_format_doctor_name(doctor)}",
         detail=payload.notes,
     )
     db.commit()

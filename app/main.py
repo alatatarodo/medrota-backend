@@ -28,6 +28,18 @@ def ensure_schema_updates():
             )
 
     with engine.begin() as connection:
+        if "title" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN title VARCHAR(20) NOT NULL DEFAULT 'Dr'"))
+        if "preferred_name" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN preferred_name VARCHAR(100)"))
+        if "employment_type" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN employment_type VARCHAR(50) NOT NULL DEFAULT 'Substantive'"))
+        if "training_stage" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN training_stage VARCHAR(100)"))
+        if "roster_role" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN roster_role VARCHAR(100)"))
+
+    with engine.begin() as connection:
         if "approved_by" not in availability_columns:
             connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approved_by VARCHAR(100)"))
         if "approved_at" not in availability_columns:

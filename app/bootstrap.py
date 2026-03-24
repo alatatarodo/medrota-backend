@@ -154,6 +154,32 @@ with NAME_CATALOG_PATH.open("r", encoding="utf-8") as catalog_file:
 
 FIRST_NAMES = NAME_CATALOG["first_names"]
 LAST_NAMES = NAME_CATALOG["last_names"]
+EMPLOYMENT_TYPE_CYCLE = [
+    "Substantive",
+    "Substantive",
+    "Substantive",
+    "Substantive",
+    "Substantive",
+    "Trust Grade",
+    "Clinical Fellow",
+    "Academic Clinical Fellow",
+]
+
+TRAINING_STAGE_BY_GRADE = {
+    DoctorGrade.FY1: "Foundation Year 1",
+    DoctorGrade.FY2: "Foundation Year 2",
+    DoctorGrade.SHO: "Core Trainee / SHO",
+    DoctorGrade.ST1: "Specialty Training Year 1",
+    DoctorGrade.ST2: "Specialty Training Year 2",
+    DoctorGrade.ST3: "Specialty Training Year 3",
+    DoctorGrade.ST4: "Specialty Training Year 4",
+    DoctorGrade.ST5: "Specialty Training Year 5",
+    DoctorGrade.ST6: "Specialty Training Year 6",
+    DoctorGrade.ST7: "Specialty Training Year 7",
+    DoctorGrade.ST8: "Specialty Training Year 8",
+    DoctorGrade.REGISTRAR: "Senior Registrar",
+    DoctorGrade.CONSULTANT: "Consultant Grade",
+}
 
 
 def _doctor_identity(sequence: int) -> tuple[str, str, str]:
@@ -163,26 +189,54 @@ def _doctor_identity(sequence: int) -> tuple[str, str, str]:
     return first_name, last_name, email
 
 
-def _backfill_placeholder_doctor_names(db: Session) -> None:
-    placeholder_doctors = (
+def _doctor_profile(sequence: int, grade: DoctorGrade) -> dict:
+    return {
+        "title": "Dr",
+        "preferred_name": FIRST_NAMES[(sequence - 1) % len(FIRST_NAMES)],
+        "employment_type": EMPLOYMENT_TYPE_CYCLE[(sequence - 1) % len(EMPLOYMENT_TYPE_CYCLE)],
+        "training_stage": TRAINING_STAGE_BY_GRADE.get(grade, "Medical Workforce"),
+        "roster_role": "Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor",
+    }
+
+
+def _backfill_seeded_doctor_profiles(db: Session) -> None:
+    seeded_doctors = (
         db.query(Doctor)
         .filter(Doctor.id.like("doc-%"))
-        .filter(Doctor.email.like("%@medrota.ai"))
         .all()
     )
 
     updated = False
-    for doctor in placeholder_doctors:
+    for doctor in seeded_doctors:
         try:
             sequence = int(doctor.id.split("-")[-1])
         except ValueError:
             continue
 
         first_name, last_name, email = _doctor_identity(sequence)
-        doctor.first_name = first_name
-        doctor.last_name = last_name
-        doctor.email = email
-        updated = True
+        profile = _doctor_profile(sequence, doctor.grade)
+
+        if doctor.first_name.startswith("Doctor") or doctor.email.endswith("@medrota.ai"):
+            doctor.first_name = first_name
+            doctor.last_name = last_name
+            doctor.email = email
+            updated = True
+
+        if not doctor.title:
+            doctor.title = profile["title"]
+            updated = True
+        if not doctor.preferred_name:
+            doctor.preferred_name = profile["preferred_name"]
+            updated = True
+        if not doctor.employment_type:
+            doctor.employment_type = profile["employment_type"]
+            updated = True
+        if not doctor.training_stage:
+            doctor.training_stage = profile["training_stage"]
+            updated = True
+        if not doctor.roster_role:
+            doctor.roster_role = profile["roster_role"]
+            updated = True
 
     if updated:
         db.commit()
@@ -201,14 +255,21 @@ def _seed_doctors_and_contracts(db: Session) -> None:
             sequence = site_index * 800 + site_offset + 1
             doctor_id = f"doc-{sequence:05d}"
             first_name, last_name, email = _doctor_identity(sequence)
+            grade = GRADE_CYCLE[(sequence - 1) % len(GRADE_CYCLE)]
+            profile = _doctor_profile(sequence, grade)
             doctor = Doctor(
                 id=doctor_id,
                 gmc_number=f"70{sequence:05d}",
+                title=profile["title"],
                 first_name=first_name,
+                preferred_name=profile["preferred_name"],
                 last_name=last_name,
                 email=email,
-                grade=GRADE_CYCLE[(sequence - 1) % len(GRADE_CYCLE)],
+                grade=grade,
                 specialty=SPECIALTY_CYCLE[(sequence - 1) % len(SPECIALTY_CYCLE)],
+                employment_type=profile["employment_type"],
+                training_stage=profile["training_stage"],
+                roster_role=profile["roster_role"],
                 hospital_site=site_name,
             )
             doctors_to_create.append(doctor)
@@ -460,7 +521,7 @@ def _seed_locum_requests(db: Session, shifts_by_code: dict[str, ShiftType]) -> N
 def seed_sample_data(db: Session) -> None:
     """Seed baseline doctors and richer operational demo data."""
     _seed_doctors_and_contracts(db)
-    _backfill_placeholder_doctor_names(db)
+    _backfill_seeded_doctor_profiles(db)
     shifts_by_code = _seed_shift_types(db)
     doctors = db.query(Doctor).all()
     _seed_availability_events(db, doctors)

@@ -9,6 +9,33 @@ from app.db.database import Base, engine
 
 router = APIRouter(prefix="/api/v1/doctors", tags=["doctors"])
 
+TRAINING_STAGE_DEFAULTS = {
+    DoctorGrade.FY1: "Foundation Year 1",
+    DoctorGrade.FY2: "Foundation Year 2",
+    DoctorGrade.SHO: "Core Trainee / SHO",
+    DoctorGrade.ST1: "Specialty Training Year 1",
+    DoctorGrade.ST2: "Specialty Training Year 2",
+    DoctorGrade.ST3: "Specialty Training Year 3",
+    DoctorGrade.ST4: "Specialty Training Year 4",
+    DoctorGrade.ST5: "Specialty Training Year 5",
+    DoctorGrade.ST6: "Specialty Training Year 6",
+    DoctorGrade.ST7: "Specialty Training Year 7",
+    DoctorGrade.ST8: "Specialty Training Year 8",
+    DoctorGrade.REGISTRAR: "Senior Registrar",
+    DoctorGrade.CONSULTANT: "Consultant Grade",
+}
+
+
+def _doctor_defaults(payload: DoctorCreate | None = None) -> dict:
+    grade = payload.grade if payload else DoctorGrade.FY1
+    return {
+        "title": (payload.title if payload else None) or "Dr",
+        "preferred_name": (payload.preferred_name if payload else None) or (payload.first_name if payload else None),
+        "employment_type": (payload.employment_type if payload else None) or "Substantive",
+        "training_stage": (payload.training_stage if payload else None) or TRAINING_STAGE_DEFAULTS.get(grade, grade.value if hasattr(grade, "value") else str(grade)),
+        "roster_role": (payload.roster_role if payload else None) or ("Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor"),
+    }
+
 
 @router.post("/", response_model=DoctorResponse, status_code=status.HTTP_201_CREATED)
 def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
@@ -19,14 +46,21 @@ def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="GMC number already exists")
     
+    defaults = _doctor_defaults(doctor)
+
     db_doctor = Doctor(
         id=str(uuid.uuid4()),
         gmc_number=doctor.gmc_number,
+        title=defaults["title"],
         first_name=doctor.first_name,
+        preferred_name=defaults["preferred_name"],
         last_name=doctor.last_name,
         email=doctor.email,
         grade=doctor.grade,
         specialty=doctor.specialty,
+        employment_type=defaults["employment_type"],
+        training_stage=defaults["training_stage"],
+        roster_role=defaults["roster_role"],
         hospital_site=doctor.hospital_site,
     )
     
@@ -60,7 +94,9 @@ def list_doctors(
             or_(
                 Doctor.id.ilike(search_term),
                 Doctor.gmc_number.ilike(search_term),
+                Doctor.title.ilike(search_term),
                 Doctor.first_name.ilike(search_term),
+                Doctor.preferred_name.ilike(search_term),
                 Doctor.last_name.ilike(search_term),
                 Doctor.email.ilike(search_term),
             )
@@ -106,14 +142,21 @@ def batch_import_doctors(payload: BatchDoctorImport, db: Session = Depends(get_d
                     })
                     continue
                 
+                defaults = _doctor_defaults(doctor_data)
+
                 db_doctor = Doctor(
                     id=str(uuid.uuid4()),
                     gmc_number=doctor_data.gmc_number,
+                    title=defaults["title"],
                     first_name=doctor_data.first_name,
+                    preferred_name=defaults["preferred_name"],
                     last_name=doctor_data.last_name,
                     email=doctor_data.email,
                     grade=doctor_data.grade,
                     specialty=doctor_data.specialty,
+                    employment_type=defaults["employment_type"],
+                    training_stage=defaults["training_stage"],
+                    roster_role=defaults["roster_role"],
                     hospital_site=doctor_data.hospital_site,
                 )
                 db.add(db_doctor)

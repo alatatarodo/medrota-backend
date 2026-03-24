@@ -13,28 +13,43 @@ from app.db.models import (
 # Doctor Schemas
 class DoctorCreate(BaseModel):
     gmc_number: str
+    title: Optional[str] = "Dr"
     first_name: str
+    preferred_name: Optional[str] = None
     last_name: str
     email: EmailStr
     grade: DoctorGrade
     specialty: str
+    employment_type: Optional[str] = "Substantive"
+    training_stage: Optional[str] = None
+    roster_role: Optional[str] = None
     hospital_site: str = "Wythenshawe Hospital"
 
 
 class DoctorUpdate(BaseModel):
+    title: Optional[str] = None
+    preferred_name: Optional[str] = None
     grade: Optional[DoctorGrade] = None
     specialty: Optional[str] = None
+    employment_type: Optional[str] = None
+    training_stage: Optional[str] = None
+    roster_role: Optional[str] = None
     hospital_site: Optional[str] = None
 
 
 class DoctorResponse(BaseModel):
     id: str
     gmc_number: str
+    title: str
     first_name: str
+    preferred_name: Optional[str] = None
     last_name: str
     email: str
     grade: DoctorGrade
     specialty: str
+    employment_type: str
+    training_stage: Optional[str] = None
+    roster_role: Optional[str] = None
     hospital_site: str
     created_at: datetime
 

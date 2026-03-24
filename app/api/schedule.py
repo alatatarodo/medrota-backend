@@ -15,6 +15,15 @@ from app.scheduler.engine import SchedulingEngine
 router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
 
 
+def _format_doctor_name(doctor: Doctor | None) -> str:
+    if not doctor:
+        return "Unknown"
+    title = (doctor.title or "Dr").strip()
+    preferred = (doctor.preferred_name or doctor.first_name or "").strip()
+    surname = (doctor.last_name or "").strip()
+    return " ".join(part for part in [title, preferred, surname] if part)
+
+
 def _get_schedule_doctors(schedule_id: str, db: Session) -> list[Doctor]:
     metric_rows = db.query(FairnessMetric).filter(FairnessMetric.schedule_id == schedule_id).all()
     doctor_ids = {row.doctor_id for row in metric_rows}
@@ -301,7 +310,7 @@ def get_compliance_report(schedule_id: str, db: Session = Depends(get_db)):
 
         violations.append(ComplianceReportDetail(
             doctor_id=v.doctor_id,
-            doctor_name=f"{doctor.first_name} {doctor.last_name}" if doctor else "Unknown",
+            doctor_name=_format_doctor_name(doctor),
             hospital_site=hospital_site,
             violation_type=v.violation_type,
             severity=v.severity,
@@ -390,7 +399,7 @@ def get_fairness_report(schedule_id: str, db: Session = Depends(get_db)):
                     doctor = doctors_by_id.get(m.doctor_id)
                     outliers.append({
                         "doctor_id": m.doctor_id,
-                        "doctor_name": f"{doctor.first_name} {doctor.last_name}" if doctor else "Unknown",
+                        "doctor_name": _format_doctor_name(doctor),
                         "hospital_site": doctor.hospital_site if doctor else "Unknown",
                         "metric": m.metric_type,
                         "value": m.assigned_count,
@@ -453,7 +462,7 @@ def list_assignments(
         ScheduleAssignmentResponse(
             id=assignment.id,
             doctor_id=assignment.doctor_id,
-            doctor_name=f"{doctor.first_name} {doctor.last_name}",
+            doctor_name=_format_doctor_name(doctor),
             hospital_site=doctor.hospital_site,
             assignment_date=assignment.assignment_date,
             shift_type_id=assignment.shift_type_id,
@@ -495,7 +504,7 @@ def export_assignments(
         writer.writerow([
             assignment.assignment_date.isoformat(),
             assignment.doctor_id,
-            f"{doctor.first_name} {doctor.last_name}",
+            _format_doctor_name(doctor),
             doctor.hospital_site,
             assignment.shift_type_id or "",
             assignment.status.value if hasattr(assignment.status, "value") else str(assignment.status),
