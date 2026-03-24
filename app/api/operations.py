@@ -19,6 +19,7 @@ from app.db.models import (
     LocumRequest,
     OperationAuditLog,
     ScheduleAssignment,
+    ServiceRequirement,
     ShiftType,
 )
 
@@ -378,6 +379,71 @@ def _build_coverage_pressure(events: list[DoctorAvailabilityEvent], locum_reques
         })
 
     return sorted(rows, key=lambda row: row["site"])
+
+
+def _parse_service_key(raw_value: str) -> tuple[str, str, str]:
+    site, department, ward = (str(raw_value or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
+    return site, department, ward
+
+
+def _build_establishment_matrix(
+    doctors: list[Doctor],
+    service_requirements: list[ServiceRequirement],
+    shift_patterns_by_id: dict[str, dict],
+) -> list[dict]:
+    doctors_by_home_base = defaultdict(list)
+    for doctor in doctors:
+        doctors_by_home_base[(doctor.hospital_site, doctor.department or doctor.specialty, doctor.ward or "Unassigned Base Ward")].append(doctor)
+
+    requirements_by_home_base = defaultdict(list)
+    for requirement in service_requirements:
+        site, department, ward = _parse_service_key(requirement.ward_or_clinic)
+        requirements_by_home_base[(site, department, ward)].append(requirement)
+
+    rows = []
+    for home_base, requirement_rows in requirements_by_home_base.items():
+        site, department, ward = home_base
+        assigned_doctors = doctors_by_home_base.get(home_base, [])
+        home_grade_mix = defaultdict(int)
+        for doctor in assigned_doctors:
+            grade_key = doctor.grade.value if hasattr(doctor.grade, "value") else str(doctor.grade)
+            home_grade_mix[grade_key] += 1
+
+        shift_requirements = []
+        for requirement in requirement_rows:
+            shift_pattern = shift_patterns_by_id.get(requirement.shift_type_id, {})
+            try:
+                grade_distribution = json.loads(requirement.grade_distribution or "{}")
+            except (TypeError, json.JSONDecodeError):
+                grade_distribution = {}
+
+            shift_requirements.append({
+                "shift_code": shift_pattern.get("code"),
+                "shift_name": shift_pattern.get("name", "Unmapped shift"),
+                "required_doctors": requirement.required_doctors,
+                "grade_distribution": grade_distribution,
+            })
+
+        core_requirement = max((item["required_doctors"] for item in shift_requirements), default=0)
+        home_allocated_doctors = len(assigned_doctors)
+        pressure_level = (
+            "HIGH" if home_allocated_doctors < core_requirement
+            else "MEDIUM" if home_allocated_doctors < core_requirement + 2
+            else "LOW"
+        )
+
+        rows.append({
+            "hospital_site": site,
+            "department": department,
+            "ward": ward,
+            "home_allocated_doctors": home_allocated_doctors,
+            "core_requirement": core_requirement,
+            "pressure_level": pressure_level,
+            "home_grade_mix": dict(home_grade_mix),
+            "shift_requirements": sorted(shift_requirements, key=lambda item: item["shift_name"] or ""),
+        })
+
+    return sorted(rows, key=lambda item: (item["hospital_site"], item["department"], item["ward"]))
 
 
 def _build_board_entries(
@@ -782,12 +848,14 @@ def build_operations_workspace_payload(db: Session) -> dict:
     shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
     events = db.query(DoctorAvailabilityEvent).order_by(DoctorAvailabilityEvent.start_date.asc()).limit(20).all()
     locum_requests = db.query(LocumRequest).order_by(LocumRequest.requested_date.asc()).all()
+    service_requirements = db.query(ServiceRequirement).all()
     audit_logs = db.query(OperationAuditLog).order_by(OperationAuditLog.created_at.desc()).limit(12).all()
     latest_schedule = db.query(GeneratedSchedule).filter(
         GeneratedSchedule.generated_successfully == True  # noqa: E712
     ).order_by(GeneratedSchedule.generated_at.desc()).first()
 
     coverage_pressure = _build_coverage_pressure(events, locum_requests)
+    establishment_matrix = _build_establishment_matrix(doctors, service_requirements, shift_patterns_by_id)
     active_absences = [event for event in events if event.end_date >= date.today()]
     active_absences = [event for event in active_absences if str(event.status).upper() != "CANCELLED"]
     pending_shift_swaps = [
@@ -815,6 +883,7 @@ def build_operations_workspace_payload(db: Session) -> dict:
             "coverage_pressure": coverage_pressure,
             "grade_distribution": _build_grade_mix(doctors),
             "recommended_actions": _build_recommended_actions(coverage_pressure, locum_requests),
+            "establishment_matrix": establishment_matrix,
             "ward_shortfalls": [
                 {
                     "site": item["hospital_site"],

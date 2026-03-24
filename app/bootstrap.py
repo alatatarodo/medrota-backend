@@ -15,6 +15,7 @@ from app.db.models import (
     LocumApprovalStatus,
     LocumRequest,
     LocumStaffType,
+    ServiceRequirement,
     ShiftType,
 )
 
@@ -218,6 +219,29 @@ CLINICAL_HOME_BASES = {
             "wards": ["Main Theatres", "Recovery", "Day Case Theatres", "Perioperative Unit"],
         },
     },
+}
+
+DEPARTMENT_ESTABLISHMENT_RULES = {
+    "General Medicine": [
+        {"shift_code": "MORNING", "required_doctors": 4, "grade_distribution": {"FY1": 1, "FY2": 1, "SHO": 1, "Registrar": 1}},
+        {"shift_code": "EVENING", "required_doctors": 2, "grade_distribution": {"FY2": 1, "SHO": 1}},
+        {"shift_code": "NIGHT", "required_doctors": 2, "grade_distribution": {"SHO": 1, "Registrar": 1}},
+    ],
+    "Emergency Department": [
+        {"shift_code": "MORNING", "required_doctors": 5, "grade_distribution": {"FY2": 1, "SHO": 1, "ST3": 1, "Registrar": 1, "Consultant": 1}},
+        {"shift_code": "TWILIGHT", "required_doctors": 4, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 1, "Consultant": 1}},
+        {"shift_code": "NIGHT", "required_doctors": 3, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 1}},
+    ],
+    "General Surgery": [
+        {"shift_code": "MORNING", "required_doctors": 3, "grade_distribution": {"FY1": 1, "SHO": 1, "Registrar": 1}},
+        {"shift_code": "EVENING", "required_doctors": 2, "grade_distribution": {"SHO": 1, "Registrar": 1}},
+        {"shift_code": "NIGHT", "required_doctors": 2, "grade_distribution": {"SHO": 1, "Registrar": 1}},
+    ],
+    "Anaesthetics & Theatres": [
+        {"shift_code": "MORNING", "required_doctors": 3, "grade_distribution": {"SHO": 1, "Registrar": 1, "Consultant": 1}},
+        {"shift_code": "LONG_DAY", "required_doctors": 2, "grade_distribution": {"Registrar": 1, "Consultant": 1}},
+        {"shift_code": "ONCALL", "required_doctors": 1, "grade_distribution": {"Consultant": 1}},
+    ],
 }
 
 
@@ -430,6 +454,35 @@ def _seed_availability_events(db: Session, doctors: list[Doctor]) -> None:
     db.commit()
 
 
+def _seed_service_requirements(db: Session, shifts_by_code: dict[str, ShiftType]) -> None:
+    if db.query(ServiceRequirement).count() > 0:
+        return
+
+    requirements = []
+    for site_name, specialty_map in CLINICAL_HOME_BASES.items():
+        for specialty, configuration in specialty_map.items():
+            department = configuration["department"]
+            rules = DEPARTMENT_ESTABLISHMENT_RULES.get(department, [])
+            for ward in configuration["wards"]:
+                for rule in rules:
+                    shift = shifts_by_code.get(rule["shift_code"])
+                    if not shift:
+                        continue
+                    requirements.append(
+                        ServiceRequirement(
+                            id=str(uuid.uuid4()),
+                            ward_or_clinic=f"{site_name}::{department}::{ward}",
+                            day_of_week="ALL",
+                            shift_type_id=shift.id,
+                            required_doctors=rule["required_doctors"],
+                            grade_distribution=json.dumps(rule["grade_distribution"]),
+                        )
+                    )
+
+    db.bulk_save_objects(requirements)
+    db.commit()
+
+
 def _calculate_estimated_cost(hours: int, grade: DoctorGrade, staff_type: LocumStaffType) -> float:
     grade_rates = {
         DoctorGrade.FY1: 38,
@@ -586,6 +639,7 @@ def seed_sample_data(db: Session) -> None:
     _seed_doctors_and_contracts(db)
     _backfill_seeded_doctor_profiles(db)
     shifts_by_code = _seed_shift_types(db)
+    _seed_service_requirements(db, shifts_by_code)
     doctors = db.query(Doctor).all()
     _seed_availability_events(db, doctors)
     _seed_locum_requests(db, shifts_by_code)
