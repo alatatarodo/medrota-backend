@@ -79,6 +79,8 @@ class Doctor(Base):
     email = Column(String(100), nullable=False)
     grade = Column(Enum(DoctorGrade), nullable=False)
     specialty = Column(String(100), nullable=False)
+    department = Column(String(100))
+    ward = Column(String(100))
     employment_type = Column(String(50), nullable=False, default="Substantive")
     training_stage = Column(String(100))
     roster_role = Column(String(100))

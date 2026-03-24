@@ -20,6 +20,8 @@ class DoctorCreate(BaseModel):
     email: EmailStr
     grade: DoctorGrade
     specialty: str
+    department: Optional[str] = None
+    ward: Optional[str] = None
     employment_type: Optional[str] = "Substantive"
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -31,6 +33,8 @@ class DoctorUpdate(BaseModel):
     preferred_name: Optional[str] = None
     grade: Optional[DoctorGrade] = None
     specialty: Optional[str] = None
+    department: Optional[str] = None
+    ward: Optional[str] = None
     employment_type: Optional[str] = None
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -47,6 +51,8 @@ class DoctorResponse(BaseModel):
     email: str
     grade: DoctorGrade
     specialty: str
+    department: Optional[str] = None
+    ward: Optional[str] = None
     employment_type: str
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None

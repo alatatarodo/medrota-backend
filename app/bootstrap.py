@@ -181,6 +181,45 @@ TRAINING_STAGE_BY_GRADE = {
     DoctorGrade.CONSULTANT: "Consultant Grade",
 }
 
+CLINICAL_HOME_BASES = {
+    "Wythenshawe Hospital": {
+        "Medicine": {
+            "department": "General Medicine",
+            "wards": ["AMU", "Ward A3", "Ward A5", "Respiratory Assessment Unit", "Frailty Assessment Unit"],
+        },
+        "Emergency Medicine": {
+            "department": "Emergency Department",
+            "wards": ["ED Majors", "ED Resus", "ED Minors", "Same Day Emergency Care", "Observation Unit"],
+        },
+        "General Surgery": {
+            "department": "General Surgery",
+            "wards": ["Ward F6", "Surgical Assessment Unit", "Colorectal Ward", "Upper GI Ward"],
+        },
+        "Anaesthetics": {
+            "department": "Anaesthetics & Theatres",
+            "wards": ["Theatres", "CEPOD Theatre", "Recovery", "Surgical Critical Care"],
+        },
+    },
+    "Trafford Hospital": {
+        "Medicine": {
+            "department": "General Medicine",
+            "wards": ["Acute Medical Unit", "Ward 12", "Ward 14", "Frailty Unit", "Ambulatory Care"],
+        },
+        "Emergency Medicine": {
+            "department": "Emergency Department",
+            "wards": ["ED Majors", "Minor Injuries Unit", "Resus Bay", "Observation Area"],
+        },
+        "General Surgery": {
+            "department": "General Surgery",
+            "wards": ["Surgical Assessment Unit", "Ward T3", "Day Surgery", "Procedure Suite"],
+        },
+        "Anaesthetics": {
+            "department": "Anaesthetics & Theatres",
+            "wards": ["Main Theatres", "Recovery", "Day Case Theatres", "Perioperative Unit"],
+        },
+    },
+}
+
 
 def _doctor_identity(sequence: int) -> tuple[str, str, str]:
     first_name = FIRST_NAMES[(sequence - 1) % len(FIRST_NAMES)]
@@ -196,6 +235,19 @@ def _doctor_profile(sequence: int, grade: DoctorGrade) -> dict:
         "employment_type": EMPLOYMENT_TYPE_CYCLE[(sequence - 1) % len(EMPLOYMENT_TYPE_CYCLE)],
         "training_stage": TRAINING_STAGE_BY_GRADE.get(grade, "Medical Workforce"),
         "roster_role": "Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor",
+    }
+
+
+def _clinical_home_assignment(sequence: int, specialty: str, hospital_site: str) -> dict:
+    site_base = CLINICAL_HOME_BASES.get(hospital_site, {})
+    specialty_base = site_base.get(specialty, {
+        "department": specialty,
+        "wards": ["Core Ward"],
+    })
+    wards = specialty_base.get("wards", ["Core Ward"])
+    return {
+        "department": specialty_base.get("department", specialty),
+        "ward": wards[(sequence - 1) % len(wards)],
     }
 
 
@@ -215,6 +267,7 @@ def _backfill_seeded_doctor_profiles(db: Session) -> None:
 
         first_name, last_name, email = _doctor_identity(sequence)
         profile = _doctor_profile(sequence, doctor.grade)
+        home_assignment = _clinical_home_assignment(sequence, doctor.specialty, doctor.hospital_site)
 
         if doctor.first_name.startswith("Doctor") or doctor.email.endswith("@medrota.ai"):
             doctor.first_name = first_name
@@ -230,6 +283,12 @@ def _backfill_seeded_doctor_profiles(db: Session) -> None:
             updated = True
         if not doctor.employment_type:
             doctor.employment_type = profile["employment_type"]
+            updated = True
+        if not doctor.department:
+            doctor.department = home_assignment["department"]
+            updated = True
+        if not doctor.ward:
+            doctor.ward = home_assignment["ward"]
             updated = True
         if not doctor.training_stage:
             doctor.training_stage = profile["training_stage"]
@@ -256,7 +315,9 @@ def _seed_doctors_and_contracts(db: Session) -> None:
             doctor_id = f"doc-{sequence:05d}"
             first_name, last_name, email = _doctor_identity(sequence)
             grade = GRADE_CYCLE[(sequence - 1) % len(GRADE_CYCLE)]
+            specialty = SPECIALTY_CYCLE[(sequence - 1) % len(SPECIALTY_CYCLE)]
             profile = _doctor_profile(sequence, grade)
+            home_assignment = _clinical_home_assignment(sequence, specialty, site_name)
             doctor = Doctor(
                 id=doctor_id,
                 gmc_number=f"70{sequence:05d}",
@@ -266,7 +327,9 @@ def _seed_doctors_and_contracts(db: Session) -> None:
                 last_name=last_name,
                 email=email,
                 grade=grade,
-                specialty=SPECIALTY_CYCLE[(sequence - 1) % len(SPECIALTY_CYCLE)],
+                specialty=specialty,
+                department=home_assignment["department"],
+                ward=home_assignment["ward"],
                 employment_type=profile["employment_type"],
                 training_stage=profile["training_stage"],
                 roster_role=profile["roster_role"],

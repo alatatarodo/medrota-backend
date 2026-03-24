@@ -28,9 +28,12 @@ TRAINING_STAGE_DEFAULTS = {
 
 def _doctor_defaults(payload: DoctorCreate | None = None) -> dict:
     grade = payload.grade if payload else DoctorGrade.FY1
+    specialty = payload.specialty if payload else "Medicine"
     return {
         "title": (payload.title if payload else None) or "Dr",
         "preferred_name": (payload.preferred_name if payload else None) or (payload.first_name if payload else None),
+        "department": (payload.department if payload else None) or specialty,
+        "ward": (payload.ward if payload else None) or "Unassigned Base Ward",
         "employment_type": (payload.employment_type if payload else None) or "Substantive",
         "training_stage": (payload.training_stage if payload else None) or TRAINING_STAGE_DEFAULTS.get(grade, grade.value if hasattr(grade, "value") else str(grade)),
         "roster_role": (payload.roster_role if payload else None) or ("Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor"),
@@ -58,6 +61,8 @@ def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
         email=doctor.email,
         grade=doctor.grade,
         specialty=doctor.specialty,
+        department=defaults["department"],
+        ward=defaults["ward"],
         employment_type=defaults["employment_type"],
         training_stage=defaults["training_stage"],
         roster_role=defaults["roster_role"],
@@ -76,6 +81,8 @@ def list_doctors(
     limit: int = 100,
     hospital_site: str = None,
     grade: DoctorGrade = None,
+    department: str = None,
+    ward: str = None,
     search: str = None,
     db: Session = Depends(get_db)
 ):
@@ -88,6 +95,12 @@ def list_doctors(
     if grade:
         query = query.filter(Doctor.grade == grade)
 
+    if department:
+        query = query.filter(Doctor.department == department)
+
+    if ward:
+        query = query.filter(Doctor.ward == ward)
+
     if search:
         search_term = f"%{search.strip()}%"
         query = query.filter(
@@ -99,6 +112,8 @@ def list_doctors(
                 Doctor.preferred_name.ilike(search_term),
                 Doctor.last_name.ilike(search_term),
                 Doctor.email.ilike(search_term),
+                Doctor.department.ilike(search_term),
+                Doctor.ward.ilike(search_term),
             )
         )
 
@@ -154,6 +169,8 @@ def batch_import_doctors(payload: BatchDoctorImport, db: Session = Depends(get_d
                     email=doctor_data.email,
                     grade=doctor_data.grade,
                     specialty=doctor_data.specialty,
+                    department=defaults["department"],
+                    ward=defaults["ward"],
                     employment_type=defaults["employment_type"],
                     training_stage=defaults["training_stage"],
                     roster_role=defaults["roster_role"],

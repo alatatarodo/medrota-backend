@@ -247,6 +247,8 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
         "doctor_id": event.doctor_id,
         "doctor_name": _format_doctor_name(doctor),
         "doctor_grade": doctor.grade.value if doctor and hasattr(doctor.grade, "value") else str(doctor.grade) if doctor else "Unknown",
+        "doctor_department": doctor.department if doctor else None,
+        "doctor_ward": doctor.ward if doctor else None,
         "hospital_site": event.hospital_site,
         "event_type": event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
         "event_label": EVENT_LABELS.get(event.event_type, str(event.event_type)),
@@ -839,6 +841,8 @@ def build_operations_workspace_payload(db: Session) -> dict:
         "compliance": _build_compliance_payload(locum_requests, shift_patterns, events, doctors_by_id),
         "reference_data": {
             "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
+            "department_options": sorted({doctor.department for doctor in doctors if doctor.department}),
+            "ward_options": sorted({doctor.ward for doctor in doctors if doctor.ward}),
             "doctor_grades": [grade.value for grade in DoctorGrade],
             "availability_event_types": [
                 {"value": event_type.value, "label": EVENT_LABELS.get(event_type, event_type.value.replace("_", " ").title())}

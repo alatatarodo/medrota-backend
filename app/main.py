@@ -34,6 +34,10 @@ def ensure_schema_updates():
             connection.execute(text("ALTER TABLE doctors ADD COLUMN preferred_name VARCHAR(100)"))
         if "employment_type" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN employment_type VARCHAR(50) NOT NULL DEFAULT 'Substantive'"))
+        if "department" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN department VARCHAR(100)"))
+        if "ward" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN ward VARCHAR(100)"))
         if "training_stage" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN training_stage VARCHAR(100)"))
         if "roster_role" not in doctor_columns:
