@@ -414,7 +414,7 @@ def _build_board_entries(
             "requested_hours": request.requested_hours,
             "staff_type": request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type),
             "shortage_reason": request.shortage_reason,
-            "finance_approval_status": request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED"),
+            "finance_approval_status": (request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED")).upper(),
             "finance_approved_by": request.finance_approved_by,
             "finance_approved_at": request.finance_approved_at.isoformat() if request.finance_approved_at else None,
             "finance_approval_comment": request.finance_approval_comment,
