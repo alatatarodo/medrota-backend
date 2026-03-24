@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 import json
+from pathlib import Path
 import uuid
 
 from sqlalchemy.orm import Session
@@ -147,6 +148,45 @@ SHIFT_BLUEPRINTS = [
     },
 ]
 
+NAME_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "doctor_name_catalog.json"
+with NAME_CATALOG_PATH.open("r", encoding="utf-8") as catalog_file:
+    NAME_CATALOG = json.load(catalog_file)
+
+FIRST_NAMES = NAME_CATALOG["first_names"]
+LAST_NAMES = NAME_CATALOG["last_names"]
+
+
+def _doctor_identity(sequence: int) -> tuple[str, str, str]:
+    first_name = FIRST_NAMES[(sequence - 1) % len(FIRST_NAMES)]
+    last_name = LAST_NAMES[((sequence - 1) // len(FIRST_NAMES)) % len(LAST_NAMES)]
+    email = f"{first_name}.{last_name}.{sequence}@mft.nhs.uk".lower()
+    return first_name, last_name, email
+
+
+def _backfill_placeholder_doctor_names(db: Session) -> None:
+    placeholder_doctors = (
+        db.query(Doctor)
+        .filter(Doctor.id.like("doc-%"))
+        .filter(Doctor.email.like("%@medrota.ai"))
+        .all()
+    )
+
+    updated = False
+    for doctor in placeholder_doctors:
+        try:
+            sequence = int(doctor.id.split("-")[-1])
+        except ValueError:
+            continue
+
+        first_name, last_name, email = _doctor_identity(sequence)
+        doctor.first_name = first_name
+        doctor.last_name = last_name
+        doctor.email = email
+        updated = True
+
+    if updated:
+        db.commit()
+
 
 def _seed_doctors_and_contracts(db: Session) -> None:
     if db.query(Doctor).count() > 0:
@@ -160,12 +200,13 @@ def _seed_doctors_and_contracts(db: Session) -> None:
         for site_offset in range(800):
             sequence = site_index * 800 + site_offset + 1
             doctor_id = f"doc-{sequence:05d}"
+            first_name, last_name, email = _doctor_identity(sequence)
             doctor = Doctor(
                 id=doctor_id,
                 gmc_number=f"70{sequence:05d}",
-                first_name=f"Doctor{sequence:04d}",
-                last_name="Wythenshawe" if site_name == "Wythenshawe Hospital" else "Trafford",
-                email=f"doctor{sequence}@medrota.ai",
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
                 grade=GRADE_CYCLE[(sequence - 1) % len(GRADE_CYCLE)],
                 specialty=SPECIALTY_CYCLE[(sequence - 1) % len(SPECIALTY_CYCLE)],
                 hospital_site=site_name,
@@ -419,6 +460,7 @@ def _seed_locum_requests(db: Session, shifts_by_code: dict[str, ShiftType]) -> N
 def seed_sample_data(db: Session) -> None:
     """Seed baseline doctors and richer operational demo data."""
     _seed_doctors_and_contracts(db)
+    _backfill_placeholder_doctor_names(db)
     shifts_by_code = _seed_shift_types(db)
     doctors = db.query(Doctor).all()
     _seed_availability_events(db, doctors)

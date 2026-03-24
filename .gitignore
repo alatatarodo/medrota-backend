@@ -1,1 +1,4 @@
-data/
+/data/
+/backend-data/
+!app/data/
+!app/data/**
