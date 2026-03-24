@@ -258,6 +258,7 @@ def _serialize_event(event: DoctorAvailabilityEvent, doctors_by_id: dict[str, Do
 def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[str, dict]) -> dict:
     shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
     governance = _build_locum_governance(request, shift_pattern)
+    finance_status = _effective_finance_approval_status(request, governance)
     return {
         "id": request.id,
         "hospital_site": request.hospital_site,
@@ -279,7 +280,7 @@ def _serialize_locum_request(request: LocumRequest, shift_patterns_by_id: dict[s
         "approved_by": request.approved_by,
         "approved_at": request.approved_at.isoformat() if request.approved_at else None,
         "approval_comment": request.approval_comment,
-        "finance_approval_status": request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED"),
+        "finance_approval_status": finance_status,
         "finance_approved_by": request.finance_approved_by,
         "finance_approved_at": request.finance_approved_at.isoformat() if request.finance_approved_at else None,
         "finance_approval_comment": request.finance_approval_comment,
@@ -303,6 +304,13 @@ def _sync_finance_approval_state(request: LocumRequest, shift_pattern: dict) -> 
         request.finance_approved_by = None
         request.finance_approved_at = None
         request.finance_approval_comment = None
+
+
+def _effective_finance_approval_status(request: LocumRequest, governance: dict) -> str:
+    current_status = (request.finance_approval_status or "").upper().strip()
+    if governance["requires_finance_signoff"]:
+        return current_status if current_status in {"APPROVED", "DECLINED", "PENDING"} else "PENDING"
+    return "NOT_REQUIRED"
 
 
 def _build_grade_mix(doctors: list[Doctor]) -> list[dict]:
@@ -395,6 +403,7 @@ def _build_board_entries(
             continue
         shift_pattern = shift_patterns_by_id.get(request.shift_type_id, {})
         governance = _build_locum_governance(request, shift_pattern)
+        finance_status = _effective_finance_approval_status(request, governance)
         entries.append({
             "request_id": request.id,
             "date": request.requested_date.isoformat(),
@@ -414,7 +423,7 @@ def _build_board_entries(
             "requested_hours": request.requested_hours,
             "staff_type": request.staff_type.value if hasattr(request.staff_type, "value") else str(request.staff_type),
             "shortage_reason": request.shortage_reason,
-            "finance_approval_status": (request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED")).upper(),
+            "finance_approval_status": finance_status,
             "finance_approved_by": request.finance_approved_by,
             "finance_approved_at": request.finance_approved_at.isoformat() if request.finance_approved_at else None,
             "finance_approval_comment": request.finance_approval_comment,
@@ -504,7 +513,7 @@ def _build_compliance_payload(
             overdue_items += 1 if aging_status == "OVERDUE" else 0
             finance_signoffs += 1 if governance["requires_finance_signoff"] else 0
 
-        finance_status = (request.finance_approval_status or ("PENDING" if governance["requires_finance_signoff"] else "NOT_REQUIRED")).upper()
+        finance_status = _effective_finance_approval_status(request, governance)
         if governance["requires_finance_signoff"] and finance_status != "APPROVED":
             finance_queue.append({
                 "id": request.id,
