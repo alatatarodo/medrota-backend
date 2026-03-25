@@ -170,7 +170,7 @@ class FairnessAnalyzer:
                             oncall_count += 1
                 
                 # Check if weekend
-                if assignment.assignment_date.weekday() >= 4:  # Friday=4, Saturday=5, Sunday=6
+                if assignment.assignment_date.weekday() >= 5:  # Saturday=5, Sunday=6
                     weekend_count += 1
             
             metrics_by_doctor[doctor_id] = {
@@ -421,6 +421,7 @@ class SchedulingEngine:
 
             site_indices = {site: 0 for site in doctors_by_site}
             home_base_indices = defaultdict(int)
+            department_indices = defaultdict(int)
             assignment_counts_by_doctor = defaultdict(int)
             
             while current_date <= end_date:
@@ -440,8 +441,10 @@ class SchedulingEngine:
                         continue
 
                     eligible_by_home_base = defaultdict(list)
+                    eligible_by_department = defaultdict(list)
                     for doctor in eligible_doctors:
                         eligible_by_home_base[self._doctor_home_base_key(doctor)].append(doctor)
+                        eligible_by_department[(doctor.hospital_site, doctor.department or doctor.specialty)].append(doctor)
 
                     assigned_doctor_ids = set()
                     daily_site_quota = self._daily_site_assignment_quota(len(eligible_doctors))
@@ -473,16 +476,32 @@ class SchedulingEngine:
                         filled_slots = 0
 
                         while filled_slots < slots_to_fill:
-                            doctor = self._select_balanced_doctor(
-                                home_base_doctors,
-                                home_base_indices[home_base_key],
-                                assigned_doctor_ids,
-                                assignment_counts_by_doctor,
-                                shift,
-                            )
+                            doctor = None
+                            fill_source = "home_base"
+                            candidate_pools = [
+                                ("home_base", home_base_doctors, home_base_indices[home_base_key]),
+                                ("department", eligible_by_department.get((home_base_key[0], home_base_key[1]), []), department_indices[(home_base_key[0], home_base_key[1])]),
+                                ("site", eligible_doctors, site_indices[site_name]),
+                            ]
+                            for source_name, pool, rotation_index in candidate_pools:
+                                doctor = self._select_balanced_doctor(
+                                    pool,
+                                    rotation_index,
+                                    assigned_doctor_ids,
+                                    assignment_counts_by_doctor,
+                                    shift,
+                                )
+                                if doctor:
+                                    fill_source = source_name
+                                    if source_name == "home_base":
+                                        home_base_indices[home_base_key] += 1
+                                    elif source_name == "department":
+                                        department_indices[(home_base_key[0], home_base_key[1])] += 1
+                                    else:
+                                        site_indices[site_name] += 1
+                                    break
                             if not doctor:
                                 break
-                            home_base_indices[home_base_key] += 1
 
                             pending_assignments.append(ScheduleAssignment(
                                 id=str(uuid.uuid4()),
@@ -495,7 +514,8 @@ class SchedulingEngine:
                                     f"Hospital site: {site_name}; "
                                     f"Department: {home_base_key[1]}; "
                                     f"Ward: {home_base_key[2]}; "
-                                    f"Day template: {requirement.day_of_week or 'ALL'}"
+                                    f"Day template: {requirement.day_of_week or 'ALL'}; "
+                                    f"Fill source: {fill_source}"
                                 ),
                             ))
                             assigned_doctor_ids.add(doctor.id)
