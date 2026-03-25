@@ -244,6 +244,38 @@ DEPARTMENT_ESTABLISHMENT_RULES = {
     ],
 }
 
+SUPERVISING_CONSULTANT_BY_DEPARTMENT = {
+    "General Medicine": "Acute Medicine Consultant",
+    "Emergency Department": "ED Consultant in Charge",
+    "General Surgery": "Consultant General Surgeon",
+    "Anaesthetics & Theatres": "Duty Anaesthetic Consultant",
+}
+
+DAY_TYPE_ESTABLISHMENT_RULES = {
+    "General Medicine": {
+        "WEEKEND": [
+            {"shift_code": "MORNING", "required_doctors": 3, "grade_distribution": {"FY2": 1, "SHO": 1, "Registrar": 1}},
+            {"shift_code": "NIGHT", "required_doctors": 2, "grade_distribution": {"SHO": 1, "Registrar": 1}},
+        ],
+        "BANK_HOLIDAY": [
+            {"shift_code": "MORNING", "required_doctors": 3, "grade_distribution": {"FY2": 1, "SHO": 1, "Registrar": 1}},
+            {"shift_code": "EVENING", "required_doctors": 2, "grade_distribution": {"SHO": 1, "Registrar": 1}},
+        ],
+    },
+    "Emergency Department": {
+        "WEEKEND": [
+            {"shift_code": "MORNING", "required_doctors": 6, "grade_distribution": {"FY2": 1, "SHO": 1, "ST3": 1, "Registrar": 2, "Consultant": 1}},
+            {"shift_code": "TWILIGHT", "required_doctors": 5, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 2, "Consultant": 1}},
+            {"shift_code": "NIGHT", "required_doctors": 4, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 1, "Consultant": 1}},
+        ],
+        "BANK_HOLIDAY": [
+            {"shift_code": "MORNING", "required_doctors": 6, "grade_distribution": {"FY2": 1, "SHO": 1, "ST3": 1, "Registrar": 2, "Consultant": 1}},
+            {"shift_code": "TWILIGHT", "required_doctors": 5, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 2, "Consultant": 1}},
+            {"shift_code": "NIGHT", "required_doctors": 4, "grade_distribution": {"SHO": 1, "ST3": 1, "Registrar": 1, "Consultant": 1}},
+        ],
+    },
+}
+
 
 def _doctor_identity(sequence: int) -> tuple[str, str, str]:
     first_name = FIRST_NAMES[(sequence - 1) % len(FIRST_NAMES)]
@@ -476,11 +508,64 @@ def _seed_service_requirements(db: Session, shifts_by_code: dict[str, ShiftType]
                             shift_type_id=shift.id,
                             required_doctors=rule["required_doctors"],
                             grade_distribution=json.dumps(rule["grade_distribution"]),
+                            supervising_consultant=SUPERVISING_CONSULTANT_BY_DEPARTMENT.get(department),
                         )
                     )
 
     db.bulk_save_objects(requirements)
     db.commit()
+
+
+def _backfill_service_requirement_templates(db: Session, shifts_by_code: dict[str, ShiftType]) -> None:
+    requirements = db.query(ServiceRequirement).all()
+    existing_keys = {
+        (requirement.ward_or_clinic, requirement.day_of_week, requirement.shift_type_id)
+        for requirement in requirements
+    }
+
+    changed = False
+    for requirement in requirements:
+        _, department, _ = (str(requirement.ward_or_clinic or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
+        consultant_role = SUPERVISING_CONSULTANT_BY_DEPARTMENT.get(department)
+        if consultant_role and not requirement.supervising_consultant:
+            requirement.supervising_consultant = consultant_role
+            db.add(requirement)
+            changed = True
+
+    additions = []
+    for site_name, specialty_map in CLINICAL_HOME_BASES.items():
+        for specialty, configuration in specialty_map.items():
+            department = configuration["department"]
+            consultant_role = SUPERVISING_CONSULTANT_BY_DEPARTMENT.get(department)
+            for ward in configuration["wards"]:
+                ward_key = f"{site_name}::{department}::{ward}"
+                for day_template, rules in DAY_TYPE_ESTABLISHMENT_RULES.get(department, {}).items():
+                    for rule in rules:
+                        shift = shifts_by_code.get(rule["shift_code"])
+                        if not shift:
+                            continue
+                        composite_key = (ward_key, day_template, shift.id)
+                        if composite_key in existing_keys:
+                            continue
+                        additions.append(
+                            ServiceRequirement(
+                                id=str(uuid.uuid4()),
+                                ward_or_clinic=ward_key,
+                                day_of_week=day_template,
+                                shift_type_id=shift.id,
+                                required_doctors=rule["required_doctors"],
+                                grade_distribution=json.dumps(rule["grade_distribution"]),
+                                supervising_consultant=consultant_role,
+                            )
+                        )
+                        existing_keys.add(composite_key)
+
+    if additions:
+        db.bulk_save_objects(additions)
+        changed = True
+
+    if changed:
+        db.commit()
 
 
 def _calculate_estimated_cost(hours: int, grade: DoctorGrade, staff_type: LocumStaffType) -> float:
@@ -640,6 +725,7 @@ def seed_sample_data(db: Session) -> None:
     _backfill_seeded_doctor_profiles(db)
     shifts_by_code = _seed_shift_types(db)
     _seed_service_requirements(db, shifts_by_code)
+    _backfill_service_requirement_templates(db, shifts_by_code)
     doctors = db.query(Doctor).all()
     _seed_availability_events(db, doctors)
     _seed_locum_requests(db, shifts_by_code)

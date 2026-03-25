@@ -266,13 +266,16 @@ class ServiceRequirementCreate(BaseModel):
     day_of_week: str = "ALL"
     required_doctors: int = Field(default=1, ge=0, le=20)
     grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    supervising_consultant: Optional[str] = None
     created_by: Optional[str] = None
     note: Optional[str] = None
 
 
 class ServiceRequirementUpdate(BaseModel):
+    day_of_week: str = "ALL"
     required_doctors: int = Field(default=1, ge=0, le=20)
     grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    supervising_consultant: Optional[str] = None
     updated_by: Optional[str] = None
     note: Optional[str] = None
 

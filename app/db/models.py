@@ -163,10 +163,11 @@ class ServiceRequirement(Base):
     
     id = Column(String(36), primary_key=True)
     ward_or_clinic = Column(String(100), nullable=False)
-    day_of_week = Column(String(10), nullable=False)  # MON, TUE, etc. or ALL
+    day_of_week = Column(String(20), nullable=False)  # MON, TUE, WEEKEND, BANK_HOLIDAY, ALL
     shift_type_id = Column(String(36), ForeignKey("shift_types.id"))
     required_doctors = Column(Integer, nullable=False)
     grade_distribution = Column(Text)  # JSON string of grade requirements
+    supervising_consultant = Column(String(120))
     created_at = Column(DateTime, default=func.now())
 
 

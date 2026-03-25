@@ -16,6 +16,7 @@ def ensure_schema_updates():
     doctor_columns = {column["name"] for column in inspector.get_columns("doctors")}
     availability_columns = {column["name"] for column in inspector.get_columns("doctor_availability_events")}
     locum_columns = {column["name"] for column in inspector.get_columns("locum_requests")}
+    service_requirement_columns = {column["name"] for column in inspector.get_columns("service_requirements")}
 
     if "hospital_site" not in doctor_columns:
         with engine.begin() as connection:
@@ -63,6 +64,9 @@ def ensure_schema_updates():
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approved_at DATETIME"))
         if "finance_approval_comment" not in locum_columns:
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approval_comment TEXT"))
+
+        if "supervising_consultant" not in service_requirement_columns:
+            connection.execute(text("ALTER TABLE service_requirements ADD COLUMN supervising_consultant VARCHAR(120)"))
 
 
 ensure_schema_updates()

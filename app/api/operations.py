@@ -58,6 +58,20 @@ SHIFT_METADATA = {
     "DAYTIME": {"window": "08:00 - 16:00", "label": "Day shift", "rate": 42, "min_grade": "FY1"},
 }
 
+DAY_TEMPLATE_ORDER = {
+    "ALL": 0,
+    "WEEKDAY": 1,
+    "WEEKEND": 2,
+    "BANK_HOLIDAY": 3,
+    "MON": 4,
+    "TUE": 5,
+    "WED": 6,
+    "THU": 7,
+    "FRI": 8,
+    "SAT": 9,
+    "SUN": 10,
+}
+
 EVENT_LABELS = {
     AvailabilityEventType.ZERO_DAY: "Zero Day",
     AvailabilityEventType.TCPD_DAY: "TCPD Day",
@@ -393,6 +407,10 @@ def _parse_service_key(raw_value: str) -> tuple[str, str, str]:
     return site, department, ward
 
 
+def _normalize_day_template(raw_value: str | None) -> str:
+    return str(raw_value or "ALL").strip().upper() or "ALL"
+
+
 def _sanitize_grade_distribution(raw_distribution: dict | None) -> dict[str, int]:
     sanitized_distribution = {}
     for grade, count in (raw_distribution or {}).items():
@@ -442,9 +460,10 @@ def _build_establishment_matrix(
                 "requirement_id": requirement.id,
                 "shift_code": shift_pattern.get("code"),
                 "shift_name": shift_pattern.get("name", "Unmapped shift"),
-                "day_of_week": requirement.day_of_week,
+                "day_of_week": _normalize_day_template(requirement.day_of_week),
                 "required_doctors": requirement.required_doctors,
                 "grade_distribution": grade_distribution,
+                "supervising_consultant": requirement.supervising_consultant,
             })
 
         core_requirement = max((item["required_doctors"] for item in shift_requirements), default=0)
@@ -463,7 +482,11 @@ def _build_establishment_matrix(
             "core_requirement": core_requirement,
             "pressure_level": pressure_level,
             "home_grade_mix": dict(home_grade_mix),
-            "shift_requirements": sorted(shift_requirements, key=lambda item: item["shift_name"] or ""),
+            "supervising_consultants": sorted({item["supervising_consultant"] for item in shift_requirements if item.get("supervising_consultant")}),
+            "shift_requirements": sorted(
+                shift_requirements,
+                key=lambda item: (DAY_TEMPLATE_ORDER.get(item["day_of_week"], 99), item["shift_name"] or ""),
+            ),
         })
 
     return sorted(rows, key=lambda item: (item["hospital_site"], item["department"], item["ward"]))
@@ -943,6 +966,7 @@ def build_operations_workspace_payload(db: Session) -> dict:
             "compliance_levels": [level.value for level in ComplianceLevel],
             "staff_types": ["BANK", "INTERNAL", "AGENCY"],
             "availability_statuses": ["APPROVED", "PENDING", "RECORDED", "CANCELLED"],
+            "service_day_templates": ["ALL", "WEEKDAY", "WEEKEND", "BANK_HOLIDAY", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
         },
     }
 
@@ -958,10 +982,11 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
     if not shift_pattern:
         raise HTTPException(status_code=404, detail="Shift pattern not found")
 
+    normalized_day_template = _normalize_day_template(payload.day_of_week)
     ward_key = f"{payload.hospital_site}::{payload.department}::{payload.ward}"
     existing_requirement = db.query(ServiceRequirement).filter(
         ServiceRequirement.ward_or_clinic == ward_key,
-        ServiceRequirement.day_of_week == payload.day_of_week.upper(),
+        ServiceRequirement.day_of_week == normalized_day_template,
         ServiceRequirement.shift_type_id == shift_pattern.id,
     ).first()
     if existing_requirement:
@@ -975,10 +1000,11 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
     requirement = ServiceRequirement(
         id=str(uuid.uuid4()),
         ward_or_clinic=ward_key,
-        day_of_week=payload.day_of_week.upper(),
+        day_of_week=normalized_day_template,
         shift_type_id=shift_pattern.id,
         required_doctors=payload.required_doctors,
         grade_distribution=json.dumps(sanitized_distribution),
+        supervising_consultant=payload.supervising_consultant,
     )
     db.add(requirement)
     _record_audit_event(
@@ -1004,6 +1030,7 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
         "required_doctors": requirement.required_doctors,
         "grade_distribution": sanitized_distribution,
         "day_of_week": requirement.day_of_week,
+        "supervising_consultant": requirement.supervising_consultant,
     }
 
 
@@ -1015,6 +1042,16 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
 
     site, department, ward = _parse_service_key(requirement.ward_or_clinic)
     shift_pattern = db.query(ShiftType).filter(ShiftType.id == requirement.shift_type_id).first()
+    normalized_day_template = _normalize_day_template(payload.day_of_week)
+
+    conflicting_requirement = db.query(ServiceRequirement).filter(
+        ServiceRequirement.id != requirement_id,
+        ServiceRequirement.ward_or_clinic == requirement.ward_or_clinic,
+        ServiceRequirement.day_of_week == normalized_day_template,
+        ServiceRequirement.shift_type_id == requirement.shift_type_id,
+    ).first()
+    if conflicting_requirement:
+        raise HTTPException(status_code=400, detail="A service requirement already exists for this ward, shift, and day pattern")
 
     sanitized_distribution = _sanitize_grade_distribution(payload.grade_distribution)
     total_distribution = sum(sanitized_distribution.values())
@@ -1022,7 +1059,9 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
         raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
 
     requirement.required_doctors = payload.required_doctors
+    requirement.day_of_week = normalized_day_template
     requirement.grade_distribution = json.dumps(sanitized_distribution)
+    requirement.supervising_consultant = payload.supervising_consultant
     db.add(requirement)
 
     shift_name = shift_pattern.name if shift_pattern else "Shift"
@@ -1050,6 +1089,7 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
         "required_doctors": requirement.required_doctors,
         "grade_distribution": sanitized_distribution,
         "day_of_week": requirement.day_of_week,
+        "supervising_consultant": requirement.supervising_consultant,
     }
 
 
