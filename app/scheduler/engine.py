@@ -421,6 +421,7 @@ class SchedulingEngine:
 
             site_indices = {site: 0 for site in doctors_by_site}
             home_base_indices = defaultdict(int)
+            assignment_counts_by_doctor = defaultdict(int)
             
             while current_date <= end_date:
                 for site_name, site_doctors in doctors_by_site.items():
@@ -469,16 +470,19 @@ class SchedulingEngine:
                             continue
 
                         slots_to_fill = min(required_count, daily_site_quota - len(assigned_doctor_ids))
-                        attempts = 0
                         filled_slots = 0
 
-                        while filled_slots < slots_to_fill and attempts < len(home_base_doctors) * 2:
-                            doctor = home_base_doctors[home_base_indices[home_base_key] % len(home_base_doctors)]
+                        while filled_slots < slots_to_fill:
+                            doctor = self._select_balanced_doctor(
+                                home_base_doctors,
+                                home_base_indices[home_base_key],
+                                assigned_doctor_ids,
+                                assignment_counts_by_doctor,
+                                shift,
+                            )
+                            if not doctor:
+                                break
                             home_base_indices[home_base_key] += 1
-                            attempts += 1
-
-                            if doctor.id in assigned_doctor_ids or not self._shift_allows_grade(shift, doctor):
-                                continue
 
                             pending_assignments.append(ScheduleAssignment(
                                 id=str(uuid.uuid4()),
@@ -495,10 +499,20 @@ class SchedulingEngine:
                                 ),
                             ))
                             assigned_doctor_ids.add(doctor.id)
+                            assignment_counts_by_doctor[doctor.id] += 1
                             filled_slots += 1
 
                     if not assigned_doctor_ids:
-                        doctor = eligible_doctors[site_indices[site_name] % len(eligible_doctors)]
+                        doctor = self._select_balanced_doctor(
+                            eligible_doctors,
+                            site_indices[site_name],
+                            assigned_doctor_ids,
+                            assignment_counts_by_doctor,
+                            None,
+                        )
+                        site_indices[site_name] += 1
+                        if not doctor:
+                            continue
                         shift = self._select_shift_for_doctor(
                             doctor,
                             shift_by_code,
@@ -517,8 +531,7 @@ class SchedulingEngine:
                                 status=AssignmentStatus.ASSIGNED,
                                 notes=f"Hospital site: {site_name}",
                             ))
-
-                        site_indices[site_name] += 1
+                            assignment_counts_by_doctor[doctor.id] += 1
 
                 current_date += timedelta(days=1)
 
@@ -541,6 +554,32 @@ class SchedulingEngine:
 
     def _daily_site_assignment_quota(self, eligible_count: int) -> int:
         return max(2, min(18, max(1, eligible_count // 50)))
+
+    def _select_balanced_doctor(
+        self,
+        doctors: List[Doctor],
+        rotation_index: int,
+        assigned_doctor_ids: set[str],
+        assignment_counts_by_doctor: Dict[str, int],
+        shift: Optional[ShiftType],
+    ) -> Optional[Doctor]:
+        if not doctors:
+            return None
+
+        ordered_doctors = doctors[rotation_index % len(doctors):] + doctors[:rotation_index % len(doctors)]
+        candidates = [
+            (index, doctor)
+            for index, doctor in enumerate(ordered_doctors)
+            if doctor.id not in assigned_doctor_ids and (shift is None or self._shift_allows_grade(shift, doctor))
+        ]
+        if not candidates:
+            return None
+
+        _, selected_doctor = min(
+            candidates,
+            key=lambda item: (assignment_counts_by_doctor[item[1].id], item[0]),
+        )
+        return selected_doctor
 
     def _is_supported_bank_holiday(self, current_date: date) -> bool:
         return (current_date.month, current_date.day) in {(1, 1), (12, 25), (12, 26)}
