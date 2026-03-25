@@ -258,6 +258,13 @@ class LocumRequestUpdate(LocumRequestCreate):
     pass
 
 
+class ServiceRequirementUpdate(BaseModel):
+    required_doctors: int = Field(default=1, ge=0, le=20)
+    grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    updated_by: Optional[str] = None
+    note: Optional[str] = None
+
+
 class CopilotQuickAction(BaseModel):
     label: str
     action_type: str

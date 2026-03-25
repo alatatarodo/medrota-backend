@@ -6,7 +6,13 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.schemas import AvailabilityEventCreate, AvailabilityEventUpdate, LocumRequestCreate, LocumRequestUpdate
+from app.core.schemas import (
+    AvailabilityEventCreate,
+    AvailabilityEventUpdate,
+    LocumRequestCreate,
+    LocumRequestUpdate,
+    ServiceRequirementUpdate,
+)
 from app.db.database import get_db
 from app.db.models import (
     AvailabilityEventType,
@@ -418,8 +424,10 @@ def _build_establishment_matrix(
                 grade_distribution = {}
 
             shift_requirements.append({
+                "requirement_id": requirement.id,
                 "shift_code": shift_pattern.get("code"),
                 "shift_name": shift_pattern.get("name", "Unmapped shift"),
+                "day_of_week": requirement.day_of_week,
                 "required_doctors": requirement.required_doctors,
                 "grade_distribution": grade_distribution,
             })
@@ -927,6 +935,61 @@ def build_operations_workspace_payload(db: Session) -> dict:
 @router.get("/workspace")
 def get_operations_workspace(db: Session = Depends(get_db)):
     return build_operations_workspace_payload(db)
+
+
+@router.put("/service-requirements/{requirement_id}")
+def update_service_requirement(requirement_id: str, payload: ServiceRequirementUpdate, db: Session = Depends(get_db)):
+    requirement = db.query(ServiceRequirement).filter(ServiceRequirement.id == requirement_id).first()
+    if not requirement:
+        raise HTTPException(status_code=404, detail="Service requirement not found")
+
+    site, department, ward = _parse_service_key(requirement.ward_or_clinic)
+    shift_pattern = db.query(ShiftType).filter(ShiftType.id == requirement.shift_type_id).first()
+
+    sanitized_distribution = {}
+    for grade, count in (payload.grade_distribution or {}).items():
+        if not str(grade).strip():
+            continue
+        try:
+            parsed_count = int(count)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Invalid grade count for {grade}")
+        if parsed_count > 0:
+            sanitized_distribution[str(grade)] = parsed_count
+    total_distribution = sum(sanitized_distribution.values())
+    if total_distribution > payload.required_doctors:
+        raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
+
+    requirement.required_doctors = payload.required_doctors
+    requirement.grade_distribution = json.dumps(sanitized_distribution)
+    db.add(requirement)
+
+    shift_name = shift_pattern.name if shift_pattern else "Shift"
+    detail = payload.note or f"{ward} now requires {payload.required_doctors} doctors for {shift_name}"
+    _record_audit_event(
+        db,
+        entity_type="SERVICE_REQUIREMENT",
+        entity_id=requirement.id,
+        action="UPDATED",
+        hospital_site=site,
+        actor_name=payload.updated_by or "Rota Planning Desk",
+        summary=f"Updated establishment rule for {ward}",
+        detail=detail,
+    )
+
+    db.commit()
+    db.refresh(requirement)
+
+    return {
+        "id": requirement.id,
+        "hospital_site": site,
+        "department": department,
+        "ward": ward,
+        "shift_name": shift_name,
+        "required_doctors": requirement.required_doctors,
+        "grade_distribution": sanitized_distribution,
+        "day_of_week": requirement.day_of_week,
+    }
 
 
 @router.post("/availability-events", status_code=201)
