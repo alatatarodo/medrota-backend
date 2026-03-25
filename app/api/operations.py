@@ -11,6 +11,7 @@ from app.core.schemas import (
     AvailabilityEventUpdate,
     LocumRequestCreate,
     LocumRequestUpdate,
+    ServiceRequirementCreate,
     ServiceRequirementUpdate,
 )
 from app.db.database import get_db
@@ -390,6 +391,20 @@ def _build_coverage_pressure(events: list[DoctorAvailabilityEvent], locum_reques
 def _parse_service_key(raw_value: str) -> tuple[str, str, str]:
     site, department, ward = (str(raw_value or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
     return site, department, ward
+
+
+def _sanitize_grade_distribution(raw_distribution: dict | None) -> dict[str, int]:
+    sanitized_distribution = {}
+    for grade, count in (raw_distribution or {}).items():
+        if not str(grade).strip():
+            continue
+        try:
+            parsed_count = int(count)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Invalid grade count for {grade}")
+        if parsed_count > 0:
+            sanitized_distribution[str(grade)] = parsed_count
+    return sanitized_distribution
 
 
 def _build_establishment_matrix(
@@ -937,6 +952,61 @@ def get_operations_workspace(db: Session = Depends(get_db)):
     return build_operations_workspace_payload(db)
 
 
+@router.post("/service-requirements", status_code=201)
+def create_service_requirement(payload: ServiceRequirementCreate, db: Session = Depends(get_db)):
+    shift_pattern = db.query(ShiftType).filter(ShiftType.code == payload.shift_code.upper()).first()
+    if not shift_pattern:
+        raise HTTPException(status_code=404, detail="Shift pattern not found")
+
+    ward_key = f"{payload.hospital_site}::{payload.department}::{payload.ward}"
+    existing_requirement = db.query(ServiceRequirement).filter(
+        ServiceRequirement.ward_or_clinic == ward_key,
+        ServiceRequirement.day_of_week == payload.day_of_week.upper(),
+        ServiceRequirement.shift_type_id == shift_pattern.id,
+    ).first()
+    if existing_requirement:
+        raise HTTPException(status_code=400, detail="A service requirement already exists for this ward, shift, and day pattern")
+
+    sanitized_distribution = _sanitize_grade_distribution(payload.grade_distribution)
+    total_distribution = sum(sanitized_distribution.values())
+    if total_distribution > payload.required_doctors:
+        raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
+
+    requirement = ServiceRequirement(
+        id=str(uuid.uuid4()),
+        ward_or_clinic=ward_key,
+        day_of_week=payload.day_of_week.upper(),
+        shift_type_id=shift_pattern.id,
+        required_doctors=payload.required_doctors,
+        grade_distribution=json.dumps(sanitized_distribution),
+    )
+    db.add(requirement)
+    _record_audit_event(
+        db,
+        entity_type="SERVICE_REQUIREMENT",
+        entity_id=requirement.id,
+        action="CREATED",
+        hospital_site=payload.hospital_site,
+        actor_name=payload.created_by or "Rota Planning Desk",
+        summary=f"Created establishment rule for {payload.ward}",
+        detail=payload.note or f"{payload.ward} now has a {shift_pattern.name} requirement of {payload.required_doctors}",
+    )
+    db.commit()
+    db.refresh(requirement)
+
+    return {
+        "id": requirement.id,
+        "hospital_site": payload.hospital_site,
+        "department": payload.department,
+        "ward": payload.ward,
+        "shift_name": shift_pattern.name,
+        "shift_code": shift_pattern.code,
+        "required_doctors": requirement.required_doctors,
+        "grade_distribution": sanitized_distribution,
+        "day_of_week": requirement.day_of_week,
+    }
+
+
 @router.put("/service-requirements/{requirement_id}")
 def update_service_requirement(requirement_id: str, payload: ServiceRequirementUpdate, db: Session = Depends(get_db)):
     requirement = db.query(ServiceRequirement).filter(ServiceRequirement.id == requirement_id).first()
@@ -946,16 +1016,7 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
     site, department, ward = _parse_service_key(requirement.ward_or_clinic)
     shift_pattern = db.query(ShiftType).filter(ShiftType.id == requirement.shift_type_id).first()
 
-    sanitized_distribution = {}
-    for grade, count in (payload.grade_distribution or {}).items():
-        if not str(grade).strip():
-            continue
-        try:
-            parsed_count = int(count)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"Invalid grade count for {grade}")
-        if parsed_count > 0:
-            sanitized_distribution[str(grade)] = parsed_count
+    sanitized_distribution = _sanitize_grade_distribution(payload.grade_distribution)
     total_distribution = sum(sanitized_distribution.values())
     if total_distribution > payload.required_doctors:
         raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
@@ -989,6 +1050,44 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
         "required_doctors": requirement.required_doctors,
         "grade_distribution": sanitized_distribution,
         "day_of_week": requirement.day_of_week,
+    }
+
+
+@router.delete("/service-requirements/{requirement_id}")
+def delete_service_requirement(
+    requirement_id: str,
+    deleted_by: str | None = None,
+    note: str | None = None,
+    db: Session = Depends(get_db),
+):
+    requirement = db.query(ServiceRequirement).filter(ServiceRequirement.id == requirement_id).first()
+    if not requirement:
+        raise HTTPException(status_code=404, detail="Service requirement not found")
+
+    site, department, ward = _parse_service_key(requirement.ward_or_clinic)
+    shift_pattern = db.query(ShiftType).filter(ShiftType.id == requirement.shift_type_id).first()
+    shift_name = shift_pattern.name if shift_pattern else "Shift"
+
+    _record_audit_event(
+        db,
+        entity_type="SERVICE_REQUIREMENT",
+        entity_id=requirement.id,
+        action="DELETED",
+        hospital_site=site,
+        actor_name=deleted_by or "Rota Planning Desk",
+        summary=f"Removed establishment rule for {ward}",
+        detail=note or f"{shift_name} requirement removed from {ward}",
+    )
+    db.delete(requirement)
+    db.commit()
+
+    return {
+        "deleted": True,
+        "id": requirement_id,
+        "hospital_site": site,
+        "department": department,
+        "ward": ward,
+        "shift_name": shift_name,
     }
 
 

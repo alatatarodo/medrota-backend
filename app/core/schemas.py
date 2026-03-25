@@ -258,6 +258,18 @@ class LocumRequestUpdate(LocumRequestCreate):
     pass
 
 
+class ServiceRequirementCreate(BaseModel):
+    hospital_site: str
+    department: str
+    ward: str
+    shift_code: str
+    day_of_week: str = "ALL"
+    required_doctors: int = Field(default=1, ge=0, le=20)
+    grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    created_by: Optional[str] = None
+    note: Optional[str] = None
+
+
 class ServiceRequirementUpdate(BaseModel):
     required_doctors: int = Field(default=1, ge=0, le=20)
     grade_distribution: Dict[str, int] = Field(default_factory=dict)
