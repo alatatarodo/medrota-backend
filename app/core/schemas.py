@@ -1,6 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, List
 from app.db.models import (
     AvailabilityEventType,
     ComplianceLevel,
