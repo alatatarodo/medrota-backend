@@ -420,6 +420,7 @@ class SchedulingEngine:
                 doctors_by_site[doctor.hospital_site].append(doctor)
 
             site_indices = {site: 0 for site in doctors_by_site}
+            home_base_indices = defaultdict(int)
             
             while current_date <= end_date:
                 for site_name, site_doctors in doctors_by_site.items():
@@ -437,27 +438,87 @@ class SchedulingEngine:
                     if not eligible_doctors:
                         continue
 
-                    doctor = eligible_doctors[site_indices[site_name] % len(eligible_doctors)]
-                    shift = self._select_shift_for_doctor(
-                        doctor,
-                        shift_by_code,
-                        shift_by_id,
-                        current_date,
-                        requirements_by_home_base,
-                    )
+                    eligible_by_home_base = defaultdict(list)
+                    for doctor in eligible_doctors:
+                        eligible_by_home_base[self._doctor_home_base_key(doctor)].append(doctor)
 
-                    if shift:
-                        pending_assignments.append(ScheduleAssignment(
-                            id=str(uuid.uuid4()),
-                            schedule_id=schedule_id,
-                            doctor_id=doctor.id,
-                            assignment_date=current_date,
-                            shift_type_id=shift.id,
-                            status=AssignmentStatus.ASSIGNED,
-                            notes=f"Hospital site: {site_name}",
-                        ))
+                    assigned_doctor_ids = set()
+                    daily_site_quota = self._daily_site_assignment_quota(len(eligible_doctors))
+                    applicable_requirements = []
+                    active_templates = self._service_templates_for_date(current_date)
 
-                    site_indices[site_name] += 1
+                    for home_base_key, requirement_rows in requirements_by_home_base.items():
+                        if home_base_key[0] != site_name:
+                            continue
+                        for requirement in requirement_rows:
+                            if str(requirement.day_of_week or "ALL").upper() not in active_templates:
+                                continue
+                            shift = shift_by_id.get(requirement.shift_type_id)
+                            if not shift:
+                                continue
+                            applicable_requirements.append((int(requirement.required_doctors or 0), home_base_key, requirement, shift))
+
+                    applicable_requirements.sort(key=lambda item: item[0], reverse=True)
+
+                    for required_count, home_base_key, requirement, shift in applicable_requirements:
+                        if len(assigned_doctor_ids) >= daily_site_quota:
+                            break
+
+                        home_base_doctors = eligible_by_home_base.get(home_base_key, [])
+                        if not home_base_doctors:
+                            continue
+
+                        slots_to_fill = min(required_count, daily_site_quota - len(assigned_doctor_ids))
+                        attempts = 0
+                        filled_slots = 0
+
+                        while filled_slots < slots_to_fill and attempts < len(home_base_doctors) * 2:
+                            doctor = home_base_doctors[home_base_indices[home_base_key] % len(home_base_doctors)]
+                            home_base_indices[home_base_key] += 1
+                            attempts += 1
+
+                            if doctor.id in assigned_doctor_ids or not self._shift_allows_grade(shift, doctor):
+                                continue
+
+                            pending_assignments.append(ScheduleAssignment(
+                                id=str(uuid.uuid4()),
+                                schedule_id=schedule_id,
+                                doctor_id=doctor.id,
+                                assignment_date=current_date,
+                                shift_type_id=shift.id,
+                                status=AssignmentStatus.ASSIGNED,
+                                notes=(
+                                    f"Hospital site: {site_name}; "
+                                    f"Department: {home_base_key[1]}; "
+                                    f"Ward: {home_base_key[2]}; "
+                                    f"Day template: {requirement.day_of_week or 'ALL'}"
+                                ),
+                            ))
+                            assigned_doctor_ids.add(doctor.id)
+                            filled_slots += 1
+
+                    if not assigned_doctor_ids:
+                        doctor = eligible_doctors[site_indices[site_name] % len(eligible_doctors)]
+                        shift = self._select_shift_for_doctor(
+                            doctor,
+                            shift_by_code,
+                            shift_by_id,
+                            current_date,
+                            requirements_by_home_base,
+                        )
+
+                        if shift:
+                            pending_assignments.append(ScheduleAssignment(
+                                id=str(uuid.uuid4()),
+                                schedule_id=schedule_id,
+                                doctor_id=doctor.id,
+                                assignment_date=current_date,
+                                shift_type_id=shift.id,
+                                status=AssignmentStatus.ASSIGNED,
+                                notes=f"Hospital site: {site_name}",
+                            ))
+
+                        site_indices[site_name] += 1
 
                 current_date += timedelta(days=1)
 
@@ -474,6 +535,12 @@ class SchedulingEngine:
     def _parse_service_key(self, raw_value: str) -> Tuple[str, str, str]:
         site, department, ward = (str(raw_value or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
         return site, department, ward
+
+    def _doctor_home_base_key(self, doctor: Doctor) -> Tuple[str, str, str]:
+        return (doctor.hospital_site, doctor.department or doctor.specialty, doctor.ward or "Unassigned Base Ward")
+
+    def _daily_site_assignment_quota(self, eligible_count: int) -> int:
+        return max(2, min(18, max(1, eligible_count // 50)))
 
     def _is_supported_bank_holiday(self, current_date: date) -> bool:
         return (current_date.month, current_date.day) in {(1, 1), (12, 25), (12, 26)}
@@ -512,7 +579,7 @@ class SchedulingEngine:
                     return shift
             return None
 
-        home_base_key = (doctor.hospital_site, doctor.department or doctor.specialty, doctor.ward or "Unassigned Base Ward")
+        home_base_key = self._doctor_home_base_key(doctor)
         preferred_requirements = []
         for requirement in requirements_by_home_base.get(home_base_key, []):
             day_template = str(requirement.day_of_week or "ALL").upper()
