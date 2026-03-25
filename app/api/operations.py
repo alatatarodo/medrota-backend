@@ -411,6 +411,20 @@ def _normalize_day_template(raw_value: str | None) -> str:
     return str(raw_value or "ALL").strip().upper() or "ALL"
 
 
+def _is_supported_bank_holiday(target_date: date) -> bool:
+    return (target_date.month, target_date.day) in {(1, 1), (12, 25), (12, 26)}
+
+
+def _service_templates_for_date(target_date: date) -> set[str]:
+    templates = {"ALL"}
+    weekday_codes = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    templates.add(weekday_codes[target_date.weekday()])
+    templates.add("WEEKEND" if target_date.weekday() >= 5 else "WEEKDAY")
+    if _is_supported_bank_holiday(target_date):
+        templates.add("BANK_HOLIDAY")
+    return templates
+
+
 def _sanitize_grade_distribution(raw_distribution: dict | None) -> dict[str, int]:
     sanitized_distribution = {}
     for grade, count in (raw_distribution or {}).items():
@@ -490,6 +504,92 @@ def _build_establishment_matrix(
         })
 
     return sorted(rows, key=lambda item: (item["hospital_site"], item["department"], item["ward"]))
+
+
+def _resolve_requirement_grade(requirement: ServiceRequirement, shift_pattern: dict, grade_distribution: dict) -> DoctorGrade:
+    ranked_grades = sorted(grade_distribution.keys(), key=_grade_value, reverse=True)
+    grade_choice = ranked_grades[0] if ranked_grades else shift_pattern.get("minimum_grade", "FY1")
+    try:
+        return DoctorGrade(grade_choice)
+    except ValueError:
+        return DoctorGrade.FY1
+
+
+def _build_requirement_shortfalls(
+    latest_schedule: GeneratedSchedule | None,
+    doctors_by_id: dict[str, Doctor],
+    service_requirements: list[ServiceRequirement],
+    shift_patterns_by_id: dict[str, dict],
+    db: Session,
+) -> list[dict]:
+    today = date.today()
+    window_end = today + timedelta(days=6)
+    assignment_counts = defaultdict(int)
+
+    if latest_schedule:
+        assignments = db.query(ScheduleAssignment).filter(
+            ScheduleAssignment.schedule_id == latest_schedule.id,
+            ScheduleAssignment.assignment_date >= today,
+            ScheduleAssignment.assignment_date <= window_end,
+        ).all()
+        for assignment in assignments:
+            doctor = doctors_by_id.get(assignment.doctor_id)
+            if not doctor:
+                continue
+            assignment_counts[(
+                assignment.assignment_date.isoformat(),
+                doctor.hospital_site,
+                doctor.department or doctor.specialty,
+                doctor.ward or "Unassigned Base Ward",
+                assignment.shift_type_id,
+            )] += 1
+
+    shortfalls = []
+    current_date = today
+    while current_date <= window_end:
+        active_templates = _service_templates_for_date(current_date)
+        for requirement in service_requirements:
+            day_template = _normalize_day_template(requirement.day_of_week)
+            if day_template not in active_templates:
+                continue
+            site, department, ward = _parse_service_key(requirement.ward_or_clinic)
+            shift_pattern = shift_patterns_by_id.get(requirement.shift_type_id, {})
+            try:
+                grade_distribution = json.loads(requirement.grade_distribution or "{}")
+            except (TypeError, json.JSONDecodeError):
+                grade_distribution = {}
+            assigned_count = assignment_counts[(
+                current_date.isoformat(),
+                site,
+                department,
+                ward,
+                requirement.shift_type_id,
+            )]
+            gap_count = max(int(requirement.required_doctors or 0) - assigned_count, 0)
+            if gap_count <= 0:
+                continue
+
+            required_grade = _resolve_requirement_grade(requirement, shift_pattern, grade_distribution)
+            unit_cost = _estimate_locum_cost(required_grade, "BANK", shift_pattern.get("duration_hours", 8))
+            shortfalls.append({
+                "site": site,
+                "ward": ward,
+                "department": department,
+                "date": current_date.isoformat(),
+                "day_template": day_template,
+                "shift_name": shift_pattern.get("name", "Unmapped shift"),
+                "shift_code": shift_pattern.get("code"),
+                "required_grade": required_grade.value if hasattr(required_grade, "value") else str(required_grade),
+                "required_doctors": int(requirement.required_doctors or 0),
+                "assigned_doctors": assigned_count,
+                "gap_count": gap_count,
+                "approval_status": "TARGET_GAP",
+                "estimated_cost": round(unit_cost * gap_count, 2),
+                "supervising_consultant": requirement.supervising_consultant,
+            })
+        current_date += timedelta(days=1)
+
+    return sorted(shortfalls, key=lambda item: (-item["gap_count"], -item["estimated_cost"], item["date"], item["site"], item["ward"]))[:20]
 
 
 def _build_board_entries(
@@ -731,7 +831,7 @@ def _build_compliance_payload(
     }
 
 
-def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: list[LocumRequest]) -> list[dict]:
+def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: list[LocumRequest], requirement_shortfalls: list[dict]) -> list[dict]:
     actions = []
     for site_summary in coverage_pressure:
         if site_summary["sickness_events"] > 0:
@@ -746,6 +846,14 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
                 "detail": f"{site_summary['pending_locums']} locum requests are still pending or approved but not yet filled.",
                 "impact": "Approvals",
             })
+
+    if requirement_shortfalls:
+        biggest_gap = requirement_shortfalls[0]
+        actions.append({
+            "title": f"{biggest_gap['site']}: protect {biggest_gap['ward']} {biggest_gap['day_template'].replace('_', ' ')} cover",
+            "detail": f"{biggest_gap['gap_count']} uncovered {biggest_gap['shift_name']} slots remain against the live establishment target.",
+            "impact": "Targeted Gap",
+        })
 
     if not actions and locum_requests:
         actions.append({
@@ -902,6 +1010,7 @@ def build_operations_workspace_payload(db: Session) -> dict:
 
     coverage_pressure = _build_coverage_pressure(events, locum_requests)
     establishment_matrix = _build_establishment_matrix(doctors, service_requirements, shift_patterns_by_id)
+    requirement_shortfalls = _build_requirement_shortfalls(latest_schedule, doctors_by_id, service_requirements, shift_patterns_by_id, db)
     active_absences = [event for event in events if event.end_date >= date.today()]
     active_absences = [event for event in active_absences if str(event.status).upper() != "CANCELLED"]
     pending_shift_swaps = [
@@ -928,9 +1037,9 @@ def build_operations_workspace_payload(db: Session) -> dict:
         "rota_planning": {
             "coverage_pressure": coverage_pressure,
             "grade_distribution": _build_grade_mix(doctors),
-            "recommended_actions": _build_recommended_actions(coverage_pressure, locum_requests),
+            "recommended_actions": _build_recommended_actions(coverage_pressure, locum_requests, requirement_shortfalls),
             "establishment_matrix": establishment_matrix,
-            "ward_shortfalls": [
+            "ward_shortfalls": requirement_shortfalls[:8] if requirement_shortfalls else [
                 {
                     "site": item["hospital_site"],
                     "ward": item["ward"],

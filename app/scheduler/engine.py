@@ -395,6 +395,12 @@ class SchedulingEngine:
                 shift_types = self.db.query(ShiftType).all()
 
             shift_by_code = {shift.code: shift for shift in shift_types}
+            shift_by_id = {shift.id: shift for shift in shift_types}
+            service_requirements = self.db.query(ServiceRequirement).all()
+            requirements_by_home_base = defaultdict(list)
+            for requirement in service_requirements:
+                site, department, ward = self._parse_service_key(requirement.ward_or_clinic)
+                requirements_by_home_base[(site, department, ward)].append(requirement)
 
             contracts = self.db.query(Contract).filter(
                 Contract.doctor_id.in_([doctor.id for doctor in doctors]),
@@ -432,7 +438,13 @@ class SchedulingEngine:
                         continue
 
                     doctor = eligible_doctors[site_indices[site_name] % len(eligible_doctors)]
-                    shift = self._select_shift_for_doctor(doctor, shift_by_code, current_date)
+                    shift = self._select_shift_for_doctor(
+                        doctor,
+                        shift_by_code,
+                        shift_by_id,
+                        current_date,
+                        requirements_by_home_base,
+                    )
 
                     if shift:
                         pending_assignments.append(ScheduleAssignment(
@@ -458,16 +470,61 @@ class SchedulingEngine:
         except Exception as e:
             print(f"Scheduling error: {e}")
             return False
+
+    def _parse_service_key(self, raw_value: str) -> Tuple[str, str, str]:
+        site, department, ward = (str(raw_value or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
+        return site, department, ward
+
+    def _is_supported_bank_holiday(self, current_date: date) -> bool:
+        return (current_date.month, current_date.day) in {(1, 1), (12, 25), (12, 26)}
+
+    def _service_templates_for_date(self, current_date: date) -> set[str]:
+        templates = {"ALL"}
+        weekday_codes = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+        templates.add(weekday_codes[current_date.weekday()])
+        templates.add("WEEKEND" if current_date.weekday() >= 5 else "WEEKDAY")
+        if self._is_supported_bank_holiday(current_date):
+            templates.add("BANK_HOLIDAY")
+        return templates
+
+    def _shift_allows_grade(self, shift: ShiftType, doctor: Doctor) -> bool:
+        try:
+            allowed_grades = json.loads(shift.availability_grades or "[]")
+        except (TypeError, json.JSONDecodeError):
+            allowed_grades = []
+        grade_key = doctor.grade.value if hasattr(doctor.grade, "value") else str(doctor.grade)
+        return not allowed_grades or grade_key in allowed_grades
     
-    def _select_shift_for_doctor(self, doctor: Doctor, shift_types_by_code: Dict[str, ShiftType], 
-                                current_date: date) -> Optional[ShiftType]:
+    def _select_shift_for_doctor(
+        self,
+        doctor: Doctor,
+        shift_types_by_code: Dict[str, ShiftType],
+        shift_types_by_id: Dict[str, ShiftType],
+        current_date: date,
+        requirements_by_home_base: Dict[Tuple[str, str, str], List[ServiceRequirement]],
+    ) -> Optional[ShiftType]:
         """Select appropriate shift type for doctor"""
 
         def pick(*codes: str) -> Optional[ShiftType]:
             for code in codes:
-                if shift_types_by_code.get(code):
-                    return shift_types_by_code.get(code)
+                shift = shift_types_by_code.get(code)
+                if shift and self._shift_allows_grade(shift, doctor):
+                    return shift
             return None
+
+        home_base_key = (doctor.hospital_site, doctor.department or doctor.specialty, doctor.ward or "Unassigned Base Ward")
+        preferred_requirements = []
+        for requirement in requirements_by_home_base.get(home_base_key, []):
+            day_template = str(requirement.day_of_week or "ALL").upper()
+            if day_template not in self._service_templates_for_date(current_date):
+                continue
+            shift = shift_types_by_id.get(requirement.shift_type_id)
+            if shift and self._shift_allows_grade(shift, doctor):
+                preferred_requirements.append((int(requirement.required_doctors or 0), shift))
+
+        if preferred_requirements:
+            preferred_requirements.sort(key=lambda item: item[0], reverse=True)
+            return preferred_requirements[0][1]
 
         # FY1: morning/daytime only
         if doctor.grade == DoctorGrade.FY1:
