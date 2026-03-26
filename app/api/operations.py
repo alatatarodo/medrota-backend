@@ -515,6 +515,21 @@ def _resolve_requirement_grade(requirement: ServiceRequirement, shift_pattern: d
         return DoctorGrade.FY1
 
 
+def _parse_assignment_context(notes: str | None) -> dict[str, str]:
+    context = {}
+    if not notes:
+        return context
+    for segment in str(notes).split(";"):
+        if ":" not in segment:
+            continue
+        key, value = segment.split(":", 1)
+        normalized_key = key.strip().lower().replace(" ", "_")
+        cleaned_value = value.strip()
+        if cleaned_value:
+            context[normalized_key] = cleaned_value
+    return context
+
+
 def _build_requirement_shortfalls(
     latest_schedule: GeneratedSchedule | None,
     doctors_by_id: dict[str, Doctor],
@@ -536,11 +551,12 @@ def _build_requirement_shortfalls(
             doctor = doctors_by_id.get(assignment.doctor_id)
             if not doctor:
                 continue
+            assignment_context = _parse_assignment_context(assignment.notes)
             assignment_counts[(
                 assignment.assignment_date.isoformat(),
-                doctor.hospital_site,
-                doctor.department or doctor.specialty,
-                doctor.ward or "Unassigned Base Ward",
+                assignment_context.get("hospital_site") or doctor.hospital_site,
+                assignment_context.get("department") or doctor.department or doctor.specialty,
+                assignment_context.get("ward") or doctor.ward or "Unassigned Base Ward",
                 assignment.shift_type_id,
             )] += 1
 

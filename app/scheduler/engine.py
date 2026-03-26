@@ -529,14 +529,14 @@ class SchedulingEngine:
                             filled_slots += 1
 
                     if not assigned_doctor_ids:
-                            doctor = self._select_balanced_doctor(
-                                eligible_doctors,
-                                site_indices[site_name],
-                                assigned_doctor_ids,
-                                assignment_counts_by_doctor,
-                                None,
-                                None,
-                            )
+                        doctor = self._select_balanced_doctor(
+                            eligible_doctors,
+                            site_indices[site_name],
+                            assigned_doctor_ids,
+                            assignment_counts_by_doctor,
+                            None,
+                            None,
+                        )
                         site_indices[site_name] += 1
                         if not doctor:
                             continue
@@ -556,7 +556,12 @@ class SchedulingEngine:
                                 assignment_date=current_date,
                                 shift_type_id=shift.id,
                                 status=AssignmentStatus.ASSIGNED,
-                                notes=f"Hospital site: {site_name}",
+                                notes=(
+                                    f"Hospital site: {site_name}; "
+                                    f"Department: {doctor.department or doctor.specialty}; "
+                                    f"Ward: {doctor.ward or 'Unassigned Base Ward'}; "
+                                    "Fill source: site_fallback"
+                                ),
                             ))
                             assignment_counts_by_doctor[doctor.id] += 1
 
