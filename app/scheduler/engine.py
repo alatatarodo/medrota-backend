@@ -18,6 +18,20 @@ class ConstraintValidator:
     def __init__(self, db: Session):
         self.db = db
         self.violations: List[ComplianceViolation] = []
+        self._shift_types_by_id: Optional[Dict[str, ShiftType]] = None
+
+    def _get_shift_types_by_id(self) -> Dict[str, ShiftType]:
+        if self._shift_types_by_id is None:
+            self._shift_types_by_id = {
+                shift.id: shift
+                for shift in self.db.query(ShiftType).all()
+            }
+        return self._shift_types_by_id
+
+    def _get_shift_type(self, shift_type_id: str | None) -> Optional[ShiftType]:
+        if not shift_type_id:
+            return None
+        return self._get_shift_types_by_id().get(shift_type_id)
     
     def validate_weekly_hours(self, doctor_id: str, assignments: List[ScheduleAssignment], 
                              contract: Contract) -> List[Dict]:
@@ -35,8 +49,10 @@ class ConstraintValidator:
         # Check each week
         for week_start, week_assignments in weeks.items():
             total_hours = sum(
-                self.db.query(ShiftType).filter(ShiftType.id == a.shift_type_id).first().duration_hours
-                for a in week_assignments if a.shift_type_id
+                shift.duration_hours
+                for a in week_assignments
+                for shift in [self._get_shift_type(a.shift_type_id)]
+                if shift
             )
             
             if total_hours > contract.contracted_hours_per_week:
@@ -93,32 +109,29 @@ class ConstraintValidator:
         # FY1 cannot do on-calls or nights
         if grade == DoctorGrade.FY1:
             for assignment in assignments:
-                if assignment.shift_type_id:
-                    shift_type = self.db.query(ShiftType).filter(ShiftType.id == assignment.shift_type_id).first()
-                    if shift_type and (shift_type.is_on_call or shift_type.is_night_shift):
-                        violations.append({
-                            "type": "INVALID_GRADE_ASSIGNMENT",
-                            "severity": "ERROR",
-                            "date": str(assignment.assignment_date),
-                            "shift": shift_type.name,
-                            "description": f"FY1 cannot be assigned {shift_type.name} shift"
-                        })
+                shift_type = self._get_shift_type(assignment.shift_type_id)
+                if shift_type and (shift_type.is_on_call or shift_type.is_night_shift):
+                    violations.append({
+                        "type": "INVALID_GRADE_ASSIGNMENT",
+                        "severity": "ERROR",
+                        "date": str(assignment.assignment_date),
+                        "shift": shift_type.name,
+                        "description": f"FY1 cannot be assigned {shift_type.name} shift"
+                    })
         
         return violations
     
-    def validate_all(self, doctor_id: str, schedule_id: str, db_session: Session) -> Tuple[float, List[Dict]]:
+    def validate_all(
+        self,
+        doctor: Optional[Doctor],
+        contract: Optional[Contract],
+        assignments: List[ScheduleAssignment],
+    ) -> Tuple[float, List[Dict]]:
         """Run all validations and return compliance score + violations"""
-        doctor = db_session.query(Doctor).filter(Doctor.id == doctor_id).first()
-        contract = db_session.query(Contract).filter(Contract.doctor_id == doctor_id).first()
-        assignments = db_session.query(ScheduleAssignment).filter(
-            ScheduleAssignment.schedule_id == schedule_id,
-            ScheduleAssignment.doctor_id == doctor_id
-        ).all()
-        
         all_violations = []
         
         if contract and assignments:
-            all_violations.extend(self.validate_weekly_hours(doctor_id, assignments, contract))
+            all_violations.extend(self.validate_weekly_hours(doctor.id if doctor else "", assignments, contract))
             all_violations.extend(self.validate_rest_periods(assignments))
         
         if doctor:
@@ -143,17 +156,28 @@ class FairnessAnalyzer:
             "weekend_tolerance": settings.fairness_weekend_tolerance,
             "oncall_tolerance": settings.fairness_oncall_tolerance,
         }
+        self._shift_types_by_id: Optional[Dict[str, ShiftType]] = None
+
+    def _get_shift_types_by_id(self) -> Dict[str, ShiftType]:
+        if self._shift_types_by_id is None:
+            self._shift_types_by_id = {
+                shift.id: shift
+                for shift in self.db.query(ShiftType).all()
+            }
+        return self._shift_types_by_id
     
-    def calculate_metrics(self, schedule_id: str, doctors: List[str]) -> Tuple[float, List[Dict], List[Dict]]:
+    def calculate_metrics(
+        self,
+        assignments_by_doctor: Dict[str, List[ScheduleAssignment]],
+        doctors: List[str],
+    ) -> Tuple[float, List[Dict], List[Dict]]:
         """Calculate fairness metrics for all doctors in schedule"""
         
         metrics_by_doctor = {}
+        shift_types_by_id = self._get_shift_types_by_id()
         
         for doctor_id in doctors:
-            assignments = self.db.query(ScheduleAssignment).filter(
-                ScheduleAssignment.schedule_id == schedule_id,
-                ScheduleAssignment.doctor_id == doctor_id
-            ).all()
+            assignments = assignments_by_doctor.get(doctor_id, [])
             
             # Count shift types
             night_count = 0
@@ -161,13 +185,12 @@ class FairnessAnalyzer:
             oncall_count = 0
             
             for assignment in assignments:
-                if assignment.shift_type_id:
-                    shift = self.db.query(ShiftType).filter(ShiftType.id == assignment.shift_type_id).first()
-                    if shift:
-                        if shift.is_night_shift:
-                            night_count += 1
-                        if shift.is_on_call:
-                            oncall_count += 1
+                shift = shift_types_by_id.get(assignment.shift_type_id)
+                if shift:
+                    if shift.is_night_shift:
+                        night_count += 1
+                    if shift.is_on_call:
+                        oncall_count += 1
                 
                 # Check if weekend
                 if assignment.assignment_date.weekday() >= 5:  # Saturday=5, Sunday=6
@@ -299,13 +322,33 @@ class SchedulingEngine:
             success = self._schedule_doctors_greedy(schedule.id, doctors, year)
             if not success:
                 raise ValueError("Unable to generate assignments with the current configuration")
-            
+
+            assignments = self.db.query(ScheduleAssignment).filter(
+                ScheduleAssignment.schedule_id == schedule.id
+            ).all()
+            assignments_by_doctor = defaultdict(list)
+            for assignment in assignments:
+                assignments_by_doctor[assignment.doctor_id].append(assignment)
+
+            contracts = self.db.query(Contract).filter(
+                Contract.doctor_id.in_(doctor_ids)
+            ).all()
+            contracts_by_doctor = {}
+            for contract in contracts:
+                contracts_by_doctor.setdefault(contract.doctor_id, contract)
+
+            doctors_by_id = {doctor.id: doctor for doctor in doctors}
+             
             # Run validation
             total_compliance = 0
             total_violations = []
-            
+             
             for doctor_id in doctor_ids:
-                compliance, violations = self.validator.validate_all(doctor_id, schedule.id, self.db)
+                compliance, violations = self.validator.validate_all(
+                    doctors_by_id.get(doctor_id),
+                    contracts_by_doctor.get(doctor_id),
+                    assignments_by_doctor.get(doctor_id, []),
+                )
                 total_compliance += compliance
                 total_violations.extend([
                     {
@@ -318,10 +361,14 @@ class SchedulingEngine:
             avg_compliance = total_compliance / len(doctor_ids) if doctor_ids else 100
             
             # Calculate fairness
-            fairness_score, outliers, fairness_records = self.fairness_analyzer.calculate_metrics(schedule.id, doctor_ids)
+            fairness_score, outliers, fairness_records = self.fairness_analyzer.calculate_metrics(
+                assignments_by_doctor,
+                doctor_ids,
+            )
 
+            compliance_records = []
             for violation in total_violations:
-                self.db.add(ComplianceViolation(
+                compliance_records.append(ComplianceViolation(
                     id=str(uuid.uuid4()),
                     schedule_id=schedule.id,
                     doctor_id=violation["doctor_id"],
@@ -331,8 +378,9 @@ class SchedulingEngine:
                     suggested_fix=violation.get("suggested_fix"),
                 ))
 
+            fairness_metric_rows = []
             for record in fairness_records:
-                self.db.add(FairnessMetric(
+                fairness_metric_rows.append(FairnessMetric(
                     id=str(uuid.uuid4()),
                     schedule_id=schedule.id,
                     doctor_id=record["doctor_id"],
@@ -342,6 +390,11 @@ class SchedulingEngine:
                     variance=record["variance"],
                     within_acceptable_range=record["within_acceptable_range"],
                 ))
+
+            if compliance_records:
+                self.db.bulk_save_objects(compliance_records)
+            if fairness_metric_rows:
+                self.db.bulk_save_objects(fairness_metric_rows)
             
             # Update schedule
             schedule.compliance_score = avg_compliance
