@@ -460,11 +460,15 @@ class SchedulingEngine:
                             shift = shift_by_id.get(requirement.shift_type_id)
                             if not shift:
                                 continue
-                            applicable_requirements.append((int(requirement.required_doctors or 0), home_base_key, requirement, shift))
+                            preferred_grades = self._preferred_grades_for_requirement(requirement)
+                            applicable_requirements.append((home_base_key, requirement, shift, preferred_grades))
 
-                    applicable_requirements.sort(key=lambda item: item[0], reverse=True)
+                    applicable_requirements.sort(
+                        key=lambda item: self._requirement_priority(item[1], item[0][1], item[3]),
+                        reverse=True,
+                    )
 
-                    for required_count, home_base_key, requirement, shift in applicable_requirements:
+                    for home_base_key, requirement, shift, preferred_grades in applicable_requirements:
                         if len(assigned_doctor_ids) >= daily_site_quota:
                             break
 
@@ -472,6 +476,7 @@ class SchedulingEngine:
                         if not home_base_doctors:
                             continue
 
+                        required_count = int(requirement.required_doctors or 0)
                         slots_to_fill = min(required_count, daily_site_quota - len(assigned_doctor_ids))
                         filled_slots = 0
 
@@ -490,6 +495,7 @@ class SchedulingEngine:
                                     assigned_doctor_ids,
                                     assignment_counts_by_doctor,
                                     shift,
+                                    preferred_grades,
                                 )
                                 if doctor:
                                     fill_source = source_name
@@ -523,13 +529,14 @@ class SchedulingEngine:
                             filled_slots += 1
 
                     if not assigned_doctor_ids:
-                        doctor = self._select_balanced_doctor(
-                            eligible_doctors,
-                            site_indices[site_name],
-                            assigned_doctor_ids,
-                            assignment_counts_by_doctor,
-                            None,
-                        )
+                            doctor = self._select_balanced_doctor(
+                                eligible_doctors,
+                                site_indices[site_name],
+                                assigned_doctor_ids,
+                                assignment_counts_by_doctor,
+                                None,
+                                None,
+                            )
                         site_indices[site_name] += 1
                         if not doctor:
                             continue
@@ -575,6 +582,30 @@ class SchedulingEngine:
     def _daily_site_assignment_quota(self, eligible_count: int) -> int:
         return max(2, min(18, max(1, eligible_count // 50)))
 
+    def _preferred_grades_for_requirement(self, requirement: ServiceRequirement) -> List[str]:
+        try:
+            grade_distribution = json.loads(requirement.grade_distribution or "{}")
+        except (TypeError, json.JSONDecodeError):
+            grade_distribution = {}
+        return sorted(grade_distribution.keys(), key=self._grade_priority, reverse=True)
+
+    def _grade_priority(self, grade: str) -> int:
+        ordered_grades = [
+            "FY1", "FY2", "SHO", "ST1", "ST2", "ST3", "ST4", "ST5",
+            "ST6", "ST7", "ST8", "Registrar", "Consultant",
+        ]
+        try:
+            return ordered_grades.index(str(grade))
+        except ValueError:
+            return -1
+
+    def _requirement_priority(self, requirement: ServiceRequirement, department: str, preferred_grades: List[str]) -> Tuple[int, int, int, int]:
+        day_template = str(requirement.day_of_week or "ALL").upper()
+        seniority = self._grade_priority(preferred_grades[0]) if preferred_grades else -1
+        department_priority = 2 if department == "Emergency Department" else 1 if department == "General Medicine" else 0
+        day_priority = 2 if day_template in {"WEEKEND", "BANK_HOLIDAY"} else 1 if day_template == "ALL" else 0
+        return (seniority, department_priority, day_priority, int(requirement.required_doctors or 0))
+
     def _select_balanced_doctor(
         self,
         doctors: List[Doctor],
@@ -582,6 +613,7 @@ class SchedulingEngine:
         assigned_doctor_ids: set[str],
         assignment_counts_by_doctor: Dict[str, int],
         shift: Optional[ShiftType],
+        preferred_grades: Optional[List[str]],
     ) -> Optional[Doctor]:
         if not doctors:
             return None
@@ -597,9 +629,21 @@ class SchedulingEngine:
 
         _, selected_doctor = min(
             candidates,
-            key=lambda item: (assignment_counts_by_doctor[item[1].id], item[0]),
+            key=lambda item: (
+                self._preferred_grade_score(item[1], preferred_grades),
+                assignment_counts_by_doctor[item[1].id],
+                item[0],
+            ),
         )
         return selected_doctor
+
+    def _preferred_grade_score(self, doctor: Doctor, preferred_grades: Optional[List[str]]) -> int:
+        if not preferred_grades:
+            return 0
+        grade_key = doctor.grade.value if hasattr(doctor.grade, "value") else str(doctor.grade)
+        if grade_key in preferred_grades:
+            return preferred_grades.index(grade_key)
+        return len(preferred_grades) + abs(self._grade_priority(grade_key) - self._grade_priority(preferred_grades[0]))
 
     def _is_supported_bank_holiday(self, current_date: date) -> bool:
         return (current_date.month, current_date.day) in {(1, 1), (12, 25), (12, 26)}
