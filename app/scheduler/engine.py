@@ -262,6 +262,56 @@ class SchedulingEngine:
         self.db = db
         self.validator = ConstraintValidator(db)
         self.fairness_analyzer = FairnessAnalyzer(db)
+
+    def _write_schedule_status(
+        self,
+        schedule: GeneratedSchedule,
+        *,
+        status: str,
+        hospital_sites: Optional[List[str]] = None,
+        site_mode: Optional[str] = None,
+        phase: Optional[str] = None,
+        progress_percent: Optional[float] = None,
+        current_day: Optional[date] = None,
+        days_processed: Optional[int] = None,
+        total_days: Optional[int] = None,
+        error: Optional[str] = None,
+        commit: bool = False,
+    ) -> None:
+        payload = {}
+        if schedule.notes:
+            try:
+                payload = json.loads(schedule.notes)
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+
+        payload["status"] = status
+        if hospital_sites is not None:
+            payload["hospital_sites"] = hospital_sites
+        if site_mode is not None:
+            payload["site_mode"] = site_mode
+        if error is not None:
+            payload["error"] = error
+        elif "error" in payload:
+            payload.pop("error", None)
+
+        progress = payload.get("progress", {})
+        if phase is not None:
+            progress["phase"] = phase
+        if progress_percent is not None:
+            progress["percent"] = round(progress_percent, 1)
+        if current_day is not None:
+            progress["current_day"] = current_day.isoformat()
+        if days_processed is not None:
+            progress["days_processed"] = days_processed
+        if total_days is not None:
+            progress["total_days"] = total_days
+        if progress:
+            payload["progress"] = progress
+
+        schedule.notes = json.dumps(payload)
+        if commit:
+            self.db.commit()
     
     def generate_rota(
         self,
@@ -321,11 +371,16 @@ class SchedulingEngine:
             doctor_ids = [doctor.id for doctor in doctors]
             schedule.total_doctors = len(doctor_ids)
             selected_sites = sorted({doctor.hospital_site for doctor in doctors})
-            schedule.notes = json.dumps({
-                "status": "processing",
-                "hospital_sites": selected_sites,
-                "site_mode": "selected" if hospital_sites else "all",
-            })
+            self._write_schedule_status(
+                schedule,
+                status="processing",
+                hospital_sites=selected_sites,
+                site_mode="selected" if hospital_sites else "all",
+                phase="preparing_roster",
+                progress_percent=2,
+                days_processed=0,
+                total_days=365,
+            )
             self.db.commit()
 
             if not doctors:
@@ -336,6 +391,16 @@ class SchedulingEngine:
             success = self._schedule_doctors_greedy(schedule.id, doctors, year)
             if not success:
                 raise ValueError("Unable to generate assignments with the current configuration")
+
+            self._write_schedule_status(
+                schedule,
+                status="processing",
+                hospital_sites=selected_sites,
+                site_mode="selected" if hospital_sites else "all",
+                phase="scoring_compliance",
+                progress_percent=84,
+            )
+            self.db.commit()
 
             assignments = self.db.query(ScheduleAssignment).filter(
                 ScheduleAssignment.schedule_id == schedule.id
@@ -375,6 +440,15 @@ class SchedulingEngine:
             avg_compliance = total_compliance / len(doctor_ids) if doctor_ids else 100
             
             # Calculate fairness
+            self._write_schedule_status(
+                schedule,
+                status="processing",
+                hospital_sites=selected_sites,
+                site_mode="selected" if hospital_sites else "all",
+                phase="calculating_fairness",
+                progress_percent=92,
+            )
+            self.db.commit()
             fairness_score, outliers, fairness_records = self.fairness_analyzer.calculate_metrics(
                 assignments_by_doctor,
                 doctor_ids,
@@ -415,11 +489,16 @@ class SchedulingEngine:
             schedule.fairness_score = fairness_score
             schedule.exception_count = len(total_violations)
             schedule.generated_successfully = True
-            schedule.notes = json.dumps({
-                "status": "complete",
-                "hospital_sites": selected_sites,
-                "site_mode": "selected" if hospital_sites else "all",
-            })
+            self._write_schedule_status(
+                schedule,
+                status="complete",
+                hospital_sites=selected_sites,
+                site_mode="selected" if hospital_sites else "all",
+                phase="complete",
+                progress_percent=100,
+                days_processed=365,
+                total_days=365,
+            )
              
             self.db.commit()
             
@@ -434,11 +513,13 @@ class SchedulingEngine:
         
         except Exception as e:
             schedule.generated_successfully = False
-            schedule.notes = json.dumps({
-                "status": "failed",
-                "error": str(e),
-                "hospital_sites": hospital_sites or [],
-            })
+            self._write_schedule_status(
+                schedule,
+                status="failed",
+                hospital_sites=hospital_sites or [],
+                error=str(e),
+                phase="failed",
+            )
             self.db.commit()
             return {
                 "schedule_id": schedule.id,
@@ -488,6 +569,7 @@ class SchedulingEngine:
             current_date = start_date
             doctors_by_site = defaultdict(list)
             pending_assignments = []
+            total_days = (end_date - start_date).days + 1
 
             for doctor in doctors:
                 doctors_by_site[doctor.hospital_site].append(doctor)
@@ -637,6 +719,24 @@ class SchedulingEngine:
                                 ),
                             ))
                             assignment_counts_by_doctor[doctor.id] += 1
+
+                days_processed = (current_date - start_date).days + 1
+                if days_processed == 1 or days_processed % 14 == 0 or current_date == end_date:
+                    schedule = self.db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+                    if schedule:
+                        sites = sorted(doctors_by_site.keys())
+                        self._write_schedule_status(
+                            schedule,
+                            status="processing",
+                            hospital_sites=sites,
+                            site_mode="all",
+                            phase="building_assignments",
+                            progress_percent=5 + ((days_processed / total_days) * 70),
+                            current_day=current_date,
+                            days_processed=days_processed,
+                            total_days=total_days,
+                            commit=True,
+                        )
 
                 current_date += timedelta(days=1)
 

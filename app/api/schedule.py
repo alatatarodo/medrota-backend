@@ -102,6 +102,7 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
         "status": _schedule_status(schedule),
         "selected_hospital_sites": notes.get("hospital_sites", []),
         "error": notes.get("error"),
+        "progress": notes.get("progress"),
         "metrics": {
             "total_doctors": schedule.total_doctors,
             "compliance_score": schedule.compliance_score,
