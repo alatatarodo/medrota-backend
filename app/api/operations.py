@@ -833,6 +833,28 @@ def _build_compliance_payload(
 
 def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: list[LocumRequest], requirement_shortfalls: list[dict]) -> list[dict]:
     actions = []
+    if requirement_shortfalls:
+        biggest_gap = requirement_shortfalls[0]
+        actions.append({
+            "title": f"{biggest_gap['site']}: protect {biggest_gap['ward']} {biggest_gap['day_template'].replace('_', ' ')} cover",
+            "detail": (
+                f"{biggest_gap['gap_count']} uncovered {biggest_gap['shift_name']} slots remain for "
+                f"{biggest_gap['required_grade']} cover on {biggest_gap['date']}."
+            ),
+            "impact": "Critical Target Gap",
+        })
+
+    consultant_gaps = [
+        item for item in requirement_shortfalls
+        if item.get("required_grade") in {"Consultant", "Registrar"} and item.get("gap_count", 0) > 0
+    ]
+    if consultant_gaps:
+        actions.append({
+            "title": "Senior-grade target gaps need escalation",
+            "detail": f"{len(consultant_gaps)} consultant or registrar-led target gaps are still open across the next 7 days.",
+            "impact": "Senior Coverage",
+        })
+
     for site_summary in coverage_pressure:
         if site_summary["sickness_events"] > 0:
             actions.append({
@@ -846,14 +868,6 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
                 "detail": f"{site_summary['pending_locums']} locum requests are still pending or approved but not yet filled.",
                 "impact": "Approvals",
             })
-
-    if requirement_shortfalls:
-        biggest_gap = requirement_shortfalls[0]
-        actions.append({
-            "title": f"{biggest_gap['site']}: protect {biggest_gap['ward']} {biggest_gap['day_template'].replace('_', ' ')} cover",
-            "detail": f"{biggest_gap['gap_count']} uncovered {biggest_gap['shift_name']} slots remain against the live establishment target.",
-            "impact": "Targeted Gap",
-        })
 
     if not actions and locum_requests:
         actions.append({
@@ -1032,6 +1046,11 @@ def build_operations_workspace_payload(db: Session) -> dict:
             "pending_shift_swaps": len(pending_shift_swaps),
             "pending_locum_requests": len(pending_locum_requests),
             "estimated_weekly_locum_cost": round(sum(float(request.estimated_cost or 0) for request in locum_requests), 2),
+            "target_gap_count": len(requirement_shortfalls),
+            "senior_target_gap_count": len([
+                item for item in requirement_shortfalls
+                if item.get("required_grade") in {"Consultant", "Registrar"} and item.get("gap_count", 0) > 0
+            ]),
             "latest_schedule_id": latest_schedule.id if latest_schedule else None,
         },
         "rota_planning": {
