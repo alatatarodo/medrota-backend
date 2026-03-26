@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime, timezone
 from typing import List, Dict, Tuple, Optional
 import json
 import uuid
@@ -306,6 +306,7 @@ class SchedulingEngine:
             progress["days_processed"] = days_processed
         if total_days is not None:
             progress["total_days"] = total_days
+        progress["last_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
         if progress:
             payload["progress"] = progress
 

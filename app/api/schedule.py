@@ -4,7 +4,7 @@ import threading
 from fastapi import APIRouter, Depends, status, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from io import StringIO
 import json
 import uuid
@@ -88,21 +88,65 @@ def _schedule_status(schedule: GeneratedSchedule) -> str:
     return "failed"
 
 
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_timestamp(value: datetime | None) -> datetime | None:
+    if not value:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _build_progress_snapshot(schedule: GeneratedSchedule, notes: dict, status_value: str) -> dict | None:
+    progress = notes.get("progress")
+    if not isinstance(progress, dict) or not progress:
+        return None
+
+    snapshot = dict(progress)
+    heartbeat_at = _parse_timestamp(snapshot.get("last_heartbeat_at"))
+    started_at = _normalize_timestamp(schedule.generated_at)
+    reference_time = heartbeat_at or started_at
+
+    age_seconds = None
+    is_stale = False
+    if reference_time:
+        age_seconds = max(0, int((datetime.now(timezone.utc) - reference_time).total_seconds()))
+        is_stale = status_value == "processing" and age_seconds >= 180
+
+    snapshot["last_heartbeat_at"] = heartbeat_at.isoformat() if heartbeat_at else snapshot.get("last_heartbeat_at")
+    snapshot["age_seconds"] = age_seconds
+    snapshot["is_stale"] = is_stale
+    return snapshot
+
+
 def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
     assignments = db.query(ScheduleAssignment).filter(
         ScheduleAssignment.schedule_id == schedule.id
     ).all()
     doctors = _get_schedule_doctors(schedule.id, db)
     notes = _parse_schedule_notes(schedule.notes)
+    status_value = _schedule_status(schedule)
+    progress = _build_progress_snapshot(schedule, notes, status_value)
 
     return {
         "id": schedule.id,
         "year": schedule.schedule_year,
         "generated_at": schedule.generated_at.isoformat(),
-        "status": _schedule_status(schedule),
+        "status": status_value,
         "selected_hospital_sites": notes.get("hospital_sites", []),
         "error": notes.get("error"),
-        "progress": notes.get("progress"),
+        "progress": progress,
         "metrics": {
             "total_doctors": schedule.total_doctors,
             "compliance_score": schedule.compliance_score,
@@ -288,6 +332,11 @@ def generate_schedule(
             "status": "processing",
             "hospital_sites": request.hospital_sites or [],
             "site_mode": "selected" if request.hospital_sites else "all",
+            "progress": {
+                "phase": "queued",
+                "percent": 0,
+                "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+            },
         }),
     )
     db.add(schedule)
