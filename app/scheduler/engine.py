@@ -268,7 +268,8 @@ class SchedulingEngine:
         year: int,
         doctor_ids: List[str] = None,
         hospital_sites: List[str] = None,
-        config: dict = None
+        config: dict = None,
+        schedule_id: Optional[str] = None,
     ) -> Dict:
         """
         Main method to generate rota for given year and doctors
@@ -282,15 +283,26 @@ class SchedulingEngine:
                 "optimization_level": "HIGH"
             }
         
-        # Create schedule record
-        schedule = GeneratedSchedule(
-            id=str(uuid.uuid4()),
-            schedule_year=year,
-            algorithm_version="1.0.0",
-            generated_successfully=False,
-            total_doctors=len(doctor_ids) if doctor_ids else 0,
-        )
-        self.db.add(schedule)
+        if schedule_id:
+            schedule = self.db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+            if not schedule:
+                raise ValueError("Schedule record not found")
+            schedule.schedule_year = year
+            schedule.algorithm_version = "1.0.0"
+            schedule.generated_successfully = False
+            schedule.total_doctors = len(doctor_ids) if doctor_ids else 0
+            schedule.compliance_score = None
+            schedule.fairness_score = None
+            schedule.exception_count = 0
+        else:
+            schedule = GeneratedSchedule(
+                id=str(uuid.uuid4()),
+                schedule_year=year,
+                algorithm_version="1.0.0",
+                generated_successfully=False,
+                total_doctors=len(doctor_ids) if doctor_ids else 0,
+            )
+            self.db.add(schedule)
         self.db.commit()
         
         try:
@@ -310,9 +322,11 @@ class SchedulingEngine:
             schedule.total_doctors = len(doctor_ids)
             selected_sites = sorted({doctor.hospital_site for doctor in doctors})
             schedule.notes = json.dumps({
+                "status": "processing",
                 "hospital_sites": selected_sites,
                 "site_mode": "selected" if hospital_sites else "all",
             })
+            self.db.commit()
 
             if not doctors:
                 raise ValueError("No doctors available for schedule generation")
@@ -401,7 +415,12 @@ class SchedulingEngine:
             schedule.fairness_score = fairness_score
             schedule.exception_count = len(total_violations)
             schedule.generated_successfully = True
-            
+            schedule.notes = json.dumps({
+                "status": "complete",
+                "hospital_sites": selected_sites,
+                "site_mode": "selected" if hospital_sites else "all",
+            })
+             
             self.db.commit()
             
             return {
@@ -416,6 +435,7 @@ class SchedulingEngine:
         except Exception as e:
             schedule.generated_successfully = False
             schedule.notes = json.dumps({
+                "status": "failed",
                 "error": str(e),
                 "hospital_sites": hospital_sites or [],
             })

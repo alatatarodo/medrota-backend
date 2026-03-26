@@ -1,13 +1,13 @@
 from collections import defaultdict
 import csv
-from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from datetime import date, datetime
 from io import StringIO
 import json
 import uuid
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.db.models import GeneratedSchedule, ScheduleAssignment, ComplianceViolation, FairnessMetric, Doctor
 from app.core.schemas import ScheduleGenerationRequest, ScheduleGenerationStatus, ComplianceReportDetail, ScheduleAssignmentResponse
 from app.scheduler.engine import SchedulingEngine
@@ -78,6 +78,15 @@ def _parse_schedule_notes(notes: str) -> dict:
         return {}
 
 
+def _schedule_status(schedule: GeneratedSchedule) -> str:
+    notes = _parse_schedule_notes(schedule.notes)
+    if schedule.generated_successfully:
+        return "complete"
+    if notes.get("status") == "processing" and not notes.get("error"):
+        return "processing"
+    return "failed"
+
+
 def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
     assignments = db.query(ScheduleAssignment).filter(
         ScheduleAssignment.schedule_id == schedule.id
@@ -89,7 +98,7 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
         "id": schedule.id,
         "year": schedule.schedule_year,
         "generated_at": schedule.generated_at.isoformat(),
-        "status": "complete" if schedule.generated_successfully else "failed",
+        "status": _schedule_status(schedule),
         "selected_hospital_sites": notes.get("hospital_sites", []),
         "error": notes.get("error"),
         "metrics": {
@@ -101,6 +110,27 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
         },
         "hospital_breakdown": _build_hospital_breakdown(doctors, assignments),
     }
+
+
+def _run_schedule_generation(
+    schedule_id: str,
+    year: int,
+    doctor_ids: list[str] | None,
+    hospital_sites: list[str] | None,
+    config: dict | None,
+):
+    db = SessionLocal()
+    try:
+        engine = SchedulingEngine(db)
+        engine.generate_rota(
+            year=year,
+            doctor_ids=doctor_ids,
+            hospital_sites=hospital_sites,
+            config=config,
+            schedule_id=schedule_id,
+        )
+    finally:
+        db.close()
 
 
 def _build_assignment_query(
@@ -227,6 +257,7 @@ def list_schedules(limit: int = 10, db: Session = Depends(get_db)):
 @router.post("/generate", response_model=ScheduleGenerationStatus)
 def generate_schedule(
     request: ScheduleGenerationRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -246,24 +277,34 @@ def generate_schedule(
         if invalid_sites:
             raise HTTPException(status_code=400, detail=f"Invalid hospital sites: {', '.join(invalid_sites)}")
     
-    # Create scheduling engine
-    engine = SchedulingEngine(db)
-    
-    # Run scheduling (could be moved to Celery for async in Phase 2)
-    result = engine.generate_rota(
-        year=request.year,
-        doctor_ids=request.doctors,
-        hospital_sites=request.hospital_sites,
-        config=request.algorithm_config
+    schedule = GeneratedSchedule(
+        id=str(uuid.uuid4()),
+        schedule_year=request.year,
+        algorithm_version="1.0.0",
+        generated_successfully=False,
+        total_doctors=0,
+        notes=json.dumps({
+            "status": "processing",
+            "hospital_sites": request.hospital_sites or [],
+            "site_mode": "selected" if request.hospital_sites else "all",
+        }),
     )
-    
-    if result["status"] == "success":
-        return ScheduleGenerationStatus(
-            status="complete",
-            poll_url=f"/api/v1/schedule/{result['schedule_id']}"
-        )
-    else:
-        raise HTTPException(status_code=500, detail=result.get("error", "Schedule generation failed"))
+    db.add(schedule)
+    db.commit()
+
+    background_tasks.add_task(
+        _run_schedule_generation,
+        schedule.id,
+        request.year,
+        request.doctors,
+        request.hospital_sites,
+        request.algorithm_config,
+    )
+
+    return ScheduleGenerationStatus(
+        status="processing",
+        poll_url=f"/api/v1/schedule/{schedule.id}"
+    )
 
 
 @router.get("/{schedule_id}", response_model=dict)
