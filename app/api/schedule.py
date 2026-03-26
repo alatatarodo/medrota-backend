@@ -1,6 +1,7 @@
 from collections import defaultdict
 import csv
-from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks
+import threading
+from fastapi import APIRouter, Depends, status, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from datetime import date, datetime
@@ -257,7 +258,6 @@ def list_schedules(limit: int = 10, db: Session = Depends(get_db)):
 @router.post("/generate", response_model=ScheduleGenerationStatus)
 def generate_schedule(
     request: ScheduleGenerationRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -292,14 +292,18 @@ def generate_schedule(
     db.add(schedule)
     db.commit()
 
-    background_tasks.add_task(
-        _run_schedule_generation,
-        schedule.id,
-        request.year,
-        request.doctors,
-        request.hospital_sites,
-        request.algorithm_config,
+    generation_thread = threading.Thread(
+        target=_run_schedule_generation,
+        args=(
+            schedule.id,
+            request.year,
+            request.doctors,
+            request.hospital_sites,
+            request.algorithm_config,
+        ),
+        daemon=True,
     )
+    generation_thread.start()
 
     return ScheduleGenerationStatus(
         status="processing",
