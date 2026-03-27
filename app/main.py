@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from app.core.config import settings
-from app.db.database import Base, SessionLocal, engine
+from app.db.database import Base, SessionLocal, database_backend_name, engine
 from app.bootstrap import seed_sample_data
 from app.api import copilot, doctors, operations, schedule
 
@@ -71,8 +71,9 @@ def ensure_schema_updates():
 
 ensure_schema_updates()
 
-with SessionLocal() as bootstrap_session:
-    seed_sample_data(bootstrap_session)
+if settings.auto_seed_sample_data:
+    with SessionLocal() as bootstrap_session:
+        seed_sample_data(bootstrap_session)
 
 # Create FastAPI app
 app = FastAPI(
@@ -100,7 +101,12 @@ app.include_router(schedule.router)
 @app.get("/health")
 def health_check():
     """Health check endpoint"""
-    return {"status": "ok", "service": "Medical Rostering API"}
+    return {
+        "status": "ok",
+        "service": "Medical Rostering API",
+        "database_backend": database_backend_name(settings.database_url),
+        "auto_seed_sample_data": settings.auto_seed_sample_data,
+    }
 
 
 @app.get("/")

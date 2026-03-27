@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Database
     data_dir: str = "./data"
     database_url: str = build_default_sqlite_url("./data")
+    auto_seed_sample_data: bool = True
     
     # API
     api_title: str = "Medical Rostering Automation API"
