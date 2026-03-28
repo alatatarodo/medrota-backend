@@ -857,3 +857,10 @@ def seed_sample_data(db: Session) -> None:
     doctors = db.query(Doctor).all()
     _seed_availability_events(db, doctors)
     _seed_locum_requests(db, shifts_by_code)
+
+
+def run_non_destructive_backfills(db: Session) -> None:
+    """Apply safe profile and planning backfills without reseeding operational data."""
+    _backfill_seeded_doctor_profiles(db)
+    shifts_by_code = _seed_shift_types(db)
+    _backfill_service_requirement_templates(db, shifts_by_code)

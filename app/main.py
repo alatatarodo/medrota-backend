@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from app.core.config import settings
 from app.db.database import Base, SessionLocal, database_backend_name, engine
-from app.bootstrap import seed_sample_data
+from app.bootstrap import run_non_destructive_backfills, seed_sample_data
 from app.api import copilot, doctors, operations, schedule
 
 # Create tables
@@ -96,6 +96,9 @@ def ensure_schema_updates():
 
 
 ensure_schema_updates()
+
+with SessionLocal() as bootstrap_session:
+    run_non_destructive_backfills(bootstrap_session)
 
 if settings.auto_seed_sample_data:
     with SessionLocal() as bootstrap_session:
