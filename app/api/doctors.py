@@ -5,7 +5,7 @@ import json
 import uuid
 from app.db.database import get_db
 from app.db.models import Doctor, Contract, DoctorGrade
-from app.core.schemas import DoctorCreate, DoctorResponse, ContractCreate, ContractResponse, BatchDoctorImport, ImportResponse
+from app.core.schemas import DoctorCreate, DoctorUpdate, DoctorResponse, ContractCreate, ContractResponse, BatchDoctorImport, ImportResponse
 from app.db.database import Base, engine
 
 router = APIRouter(prefix="/api/v1/doctors", tags=["doctors"])
@@ -26,6 +26,22 @@ TRAINING_STAGE_DEFAULTS = {
     DoctorGrade.CONSULTANT: "Consultant Grade",
 }
 
+SUPERVISION_LEVEL_DEFAULTS = {
+    DoctorGrade.FY1: "Direct Supervision",
+    DoctorGrade.FY2: "Close Supervision",
+    DoctorGrade.SHO: "Indirect Supervision",
+    DoctorGrade.ST1: "Indirect Supervision",
+    DoctorGrade.ST2: "Indirect Supervision",
+    DoctorGrade.ST3: "Registrar Oversight",
+    DoctorGrade.ST4: "Registrar Oversight",
+    DoctorGrade.ST5: "Senior Registrar Oversight",
+    DoctorGrade.ST6: "Senior Registrar Oversight",
+    DoctorGrade.ST7: "Consultant Available",
+    DoctorGrade.ST8: "Consultant Available",
+    DoctorGrade.REGISTRAR: "Consultant Available",
+    DoctorGrade.CONSULTANT: "Independent Practice",
+}
+
 
 def _doctor_defaults(payload: DoctorCreate | None = None) -> dict:
     grade = payload.grade if payload else DoctorGrade.FY1
@@ -38,6 +54,7 @@ def _doctor_defaults(payload: DoctorCreate | None = None) -> dict:
         "employment_type": (payload.employment_type if payload else None) or "Substantive",
         "training_stage": (payload.training_stage if payload else None) or TRAINING_STAGE_DEFAULTS.get(grade, grade.value if hasattr(grade, "value") else str(grade)),
         "roster_role": (payload.roster_role if payload else None) or ("Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor"),
+        "supervision_level": (payload.supervision_level if payload else None) or SUPERVISION_LEVEL_DEFAULTS.get(grade, "Indirect Supervision"),
     }
 
 
@@ -51,6 +68,30 @@ def _normalize_competencies(raw_competencies) -> list[str]:
             values = json.loads(raw_competencies)
         except (TypeError, json.JSONDecodeError):
             values = str(raw_competencies).split(",")
+    seen = set()
+    normalized = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _normalize_string_list(raw_values) -> list[str]:
+    if not raw_values:
+        return []
+    if isinstance(raw_values, list):
+        values = raw_values
+    else:
+        try:
+            values = json.loads(raw_values)
+        except (TypeError, json.JSONDecodeError):
+            values = str(raw_values).split(",")
     seen = set()
     normalized = []
     for value in values:
@@ -79,6 +120,8 @@ def _serialize_doctor(doctor: Doctor) -> dict:
         "department": doctor.department,
         "ward": doctor.ward,
         "competencies": _normalize_competencies(doctor.competencies),
+        "supervision_level": doctor.supervision_level,
+        "restricted_duties": _normalize_string_list(doctor.restricted_duties),
         "employment_type": doctor.employment_type,
         "training_stage": doctor.training_stage,
         "roster_role": doctor.roster_role,
@@ -111,6 +154,8 @@ def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
         department=defaults["department"],
         ward=defaults["ward"],
         competencies=json.dumps(_normalize_competencies(doctor.competencies)),
+        supervision_level=doctor.supervision_level or defaults.get("supervision_level"),
+        restricted_duties=json.dumps(_normalize_string_list(doctor.restricted_duties)),
         employment_type=defaults["employment_type"],
         training_stage=defaults["training_stage"],
         roster_role=defaults["roster_role"],
@@ -184,6 +229,45 @@ def get_doctor(doctor_id: str, db: Session = Depends(get_db)):
     return _serialize_doctor(doctor)
 
 
+@router.put("/{doctor_id}", response_model=DoctorResponse)
+def update_doctor(doctor_id: str, payload: DoctorUpdate, db: Session = Depends(get_db)):
+    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    if payload.title is not None:
+        doctor.title = payload.title or "Dr"
+    if payload.preferred_name is not None:
+        doctor.preferred_name = payload.preferred_name or doctor.first_name
+    if payload.grade is not None:
+        doctor.grade = payload.grade
+    if payload.specialty is not None:
+        doctor.specialty = payload.specialty
+    if payload.department is not None:
+        doctor.department = payload.department
+    if payload.ward is not None:
+        doctor.ward = payload.ward
+    if payload.competencies is not None:
+        doctor.competencies = json.dumps(_normalize_competencies(payload.competencies))
+    if payload.supervision_level is not None:
+        doctor.supervision_level = payload.supervision_level
+    if payload.restricted_duties is not None:
+        doctor.restricted_duties = json.dumps(_normalize_string_list(payload.restricted_duties))
+    if payload.employment_type is not None:
+        doctor.employment_type = payload.employment_type
+    if payload.training_stage is not None:
+        doctor.training_stage = payload.training_stage
+    if payload.roster_role is not None:
+        doctor.roster_role = payload.roster_role
+    if payload.hospital_site is not None:
+        doctor.hospital_site = payload.hospital_site
+
+    db.add(doctor)
+    db.commit()
+    db.refresh(doctor)
+    return _serialize_doctor(doctor)
+
+
 @router.post("/batch-import", response_model=ImportResponse)
 def batch_import_doctors(payload: BatchDoctorImport, db: Session = Depends(get_db)):
     """
@@ -226,6 +310,8 @@ def batch_import_doctors(payload: BatchDoctorImport, db: Session = Depends(get_d
                     department=defaults["department"],
                     ward=defaults["ward"],
                     competencies=json.dumps(_normalize_competencies(doctor_data.competencies)),
+                    supervision_level=doctor_data.supervision_level or defaults.get("supervision_level"),
+                    restricted_duties=json.dumps(_normalize_string_list(doctor_data.restricted_duties)),
                     employment_type=defaults["employment_type"],
                     training_stage=defaults["training_stage"],
                     roster_role=defaults["roster_role"],

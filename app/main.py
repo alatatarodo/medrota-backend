@@ -40,6 +40,10 @@ def ensure_schema_updates():
             connection.execute(text("ALTER TABLE doctors ADD COLUMN preferred_name VARCHAR(100)"))
         if "competencies" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN competencies TEXT"))
+        if "supervision_level" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN supervision_level VARCHAR(100)"))
+        if "restricted_duties" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN restricted_duties TEXT"))
         if "employment_type" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN employment_type VARCHAR(50) NOT NULL DEFAULT 'Substantive'"))
         if "department" not in doctor_columns:

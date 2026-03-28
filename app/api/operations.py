@@ -32,6 +32,16 @@ from app.db.models import (
 
 router = APIRouter(prefix="/api/v1/operations", tags=["operations"])
 
+SUPERVISION_LEVEL_OPTIONS = [
+    "Direct Supervision",
+    "Close Supervision",
+    "Indirect Supervision",
+    "Registrar Oversight",
+    "Senior Registrar Oversight",
+    "Consultant Available",
+    "Independent Practice",
+]
+
 GRADE_ORDER = [
     "FY1",
     "FY2",
@@ -1172,6 +1182,7 @@ def build_operations_workspace_payload(db: Session) -> dict:
             "department_options": sorted({doctor.department for doctor in doctors if doctor.department}),
             "ward_options": sorted({doctor.ward for doctor in doctors if doctor.ward}),
             "competency_options": sorted({skill for doctor in doctors for skill in _doctor_competencies(doctor)}),
+            "supervision_levels": SUPERVISION_LEVEL_OPTIONS,
             "doctor_grades": [grade.value for grade in DoctorGrade],
             "availability_event_types": [
                 {"value": event_type.value, "label": EVENT_LABELS.get(event_type, event_type.value.replace("_", " ").title())}

@@ -82,6 +82,8 @@ class Doctor(Base):
     department = Column(String(100))
     ward = Column(String(100))
     competencies = Column(Text)
+    supervision_level = Column(String(100))
+    restricted_duties = Column(Text)
     employment_type = Column(String(50), nullable=False, default="Substantive")
     training_stage = Column(String(100))
     roster_role = Column(String(100))

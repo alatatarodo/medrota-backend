@@ -23,6 +23,8 @@ class DoctorCreate(BaseModel):
     department: Optional[str] = None
     ward: Optional[str] = None
     competencies: List[str] = Field(default_factory=list)
+    supervision_level: Optional[str] = None
+    restricted_duties: List[str] = Field(default_factory=list)
     employment_type: Optional[str] = "Substantive"
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -37,6 +39,8 @@ class DoctorUpdate(BaseModel):
     department: Optional[str] = None
     ward: Optional[str] = None
     competencies: Optional[List[str]] = None
+    supervision_level: Optional[str] = None
+    restricted_duties: Optional[List[str]] = None
     employment_type: Optional[str] = None
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -56,6 +60,8 @@ class DoctorResponse(BaseModel):
     department: Optional[str] = None
     ward: Optional[str] = None
     competencies: List[str] = Field(default_factory=list)
+    supervision_level: Optional[str] = None
+    restricted_duties: List[str] = Field(default_factory=list)
     employment_type: str
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None

@@ -182,6 +182,38 @@ TRAINING_STAGE_BY_GRADE = {
     DoctorGrade.CONSULTANT: "Consultant Grade",
 }
 
+SUPERVISION_LEVEL_BY_GRADE = {
+    DoctorGrade.FY1: "Direct Supervision",
+    DoctorGrade.FY2: "Close Supervision",
+    DoctorGrade.SHO: "Indirect Supervision",
+    DoctorGrade.ST1: "Indirect Supervision",
+    DoctorGrade.ST2: "Indirect Supervision",
+    DoctorGrade.ST3: "Registrar Oversight",
+    DoctorGrade.ST4: "Registrar Oversight",
+    DoctorGrade.ST5: "Senior Registrar Oversight",
+    DoctorGrade.ST6: "Senior Registrar Oversight",
+    DoctorGrade.ST7: "Consultant Available",
+    DoctorGrade.ST8: "Consultant Available",
+    DoctorGrade.REGISTRAR: "Consultant Available",
+    DoctorGrade.CONSULTANT: "Independent Practice",
+}
+
+RESTRICTED_DUTIES_BY_GRADE = {
+    DoctorGrade.FY1: ["Night Resident", "On-Call Lead", "Resus Solo Cover"],
+    DoctorGrade.FY2: ["On-Call Lead"],
+    DoctorGrade.SHO: [],
+    DoctorGrade.ST1: [],
+    DoctorGrade.ST2: [],
+    DoctorGrade.ST3: [],
+    DoctorGrade.ST4: [],
+    DoctorGrade.ST5: [],
+    DoctorGrade.ST6: [],
+    DoctorGrade.ST7: [],
+    DoctorGrade.ST8: [],
+    DoctorGrade.REGISTRAR: [],
+    DoctorGrade.CONSULTANT: [],
+}
+
 CLINICAL_HOME_BASES = {
     "Wythenshawe Hospital": {
         "Medicine": {
@@ -405,6 +437,8 @@ def _doctor_profile(sequence: int, grade: DoctorGrade) -> dict:
         "employment_type": EMPLOYMENT_TYPE_CYCLE[(sequence - 1) % len(EMPLOYMENT_TYPE_CYCLE)],
         "training_stage": TRAINING_STAGE_BY_GRADE.get(grade, "Medical Workforce"),
         "roster_role": "Consultant" if grade == DoctorGrade.CONSULTANT else "Resident Doctor",
+        "supervision_level": SUPERVISION_LEVEL_BY_GRADE.get(grade, "Indirect Supervision"),
+        "restricted_duties": RESTRICTED_DUTIES_BY_GRADE.get(grade, []),
     }
 
 
@@ -466,9 +500,15 @@ def _backfill_seeded_doctor_profiles(db: Session) -> None:
         if not doctor.roster_role:
             doctor.roster_role = profile["roster_role"]
             updated = True
+        if not doctor.supervision_level:
+            doctor.supervision_level = profile["supervision_level"]
+            updated = True
         expected_competencies = _doctor_competencies(doctor.grade, doctor.specialty, doctor.department, doctor.ward)
         if not doctor.competencies:
             doctor.competencies = json.dumps(expected_competencies)
+            updated = True
+        if not doctor.restricted_duties:
+            doctor.restricted_duties = json.dumps(profile["restricted_duties"])
             updated = True
 
     if updated:
@@ -505,6 +545,8 @@ def _seed_doctors_and_contracts(db: Session) -> None:
                 department=home_assignment["department"],
                 ward=home_assignment["ward"],
                 competencies=json.dumps(_doctor_competencies(grade, specialty, home_assignment["department"], home_assignment["ward"])),
+                supervision_level=profile["supervision_level"],
+                restricted_duties=json.dumps(profile["restricted_duties"]),
                 employment_type=profile["employment_type"],
                 training_stage=profile["training_stage"],
                 roster_role=profile["roster_role"],
