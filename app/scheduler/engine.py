@@ -11,6 +11,151 @@ from app.db.models import (
 from app.core.config import settings
 from sqlalchemy.orm import Session
 
+SUPERVISION_LEVEL_RANKS = {
+    "Direct Supervision": 0,
+    "Close Supervision": 1,
+    "Indirect Supervision": 2,
+    "Registrar Oversight": 3,
+    "Senior Registrar Oversight": 4,
+    "Consultant Available": 5,
+    "Independent Practice": 6,
+}
+
+SHIFT_SUPERVISION_REQUIREMENTS = {
+    "DAYTIME": "Direct Supervision",
+    "MORNING": "Direct Supervision",
+    "EVENING": "Indirect Supervision",
+    "LONG_DAY": "Indirect Supervision",
+    "TWILIGHT": "Registrar Oversight",
+    "NIGHT": "Senior Registrar Oversight",
+    "ONCALL": "Consultant Available",
+}
+
+
+def _parse_string_list(raw_value) -> List[str]:
+    if not raw_value:
+        return []
+    if isinstance(raw_value, list):
+        values = raw_value
+    else:
+        try:
+            values = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            values = str(raw_value).split(",")
+    seen = set()
+    normalized = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _restricted_duties_for_context(
+    shift: Optional[ShiftType],
+    department: Optional[str],
+    ward: Optional[str],
+    required_skills: Optional[List[str]],
+) -> List[str]:
+    duties = set()
+    shift_code = str(getattr(shift, "code", "") or "").upper()
+    department_value = str(department or "").casefold()
+    ward_value = str(ward or "").casefold()
+    skill_values = {skill.casefold() for skill in (required_skills or [])}
+
+    if shift_code == "NIGHT":
+        duties.add("Night Resident")
+    if shift_code == "ONCALL":
+        duties.add("On-Call Lead")
+
+    if department_value == "emergency department" or "resus" in ward_value or "resus" in skill_values:
+        duties.add("Resus Solo Cover")
+    if "theatre" in ward_value or "theatre list" in skill_values:
+        duties.add("Theatre Solo List")
+    if "icu" in ward_value or "critical care" in ward_value:
+        duties.add("ICU Solo Cover")
+
+    return sorted(duties)
+
+
+def _required_supervision_level(
+    shift: Optional[ShiftType],
+    department: Optional[str],
+    ward: Optional[str],
+    required_skills: Optional[List[str]],
+) -> str:
+    shift_code = str(getattr(shift, "code", "") or "").upper()
+    base_level = SHIFT_SUPERVISION_REQUIREMENTS.get(shift_code, "Direct Supervision")
+    base_rank = SUPERVISION_LEVEL_RANKS.get(base_level, 0)
+    department_value = str(department or "").casefold()
+    ward_value = str(ward or "").casefold()
+    skill_values = {skill.casefold() for skill in (required_skills or [])}
+
+    if department_value == "emergency department" or "resus" in ward_value or "resus" in skill_values:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Registrar Oversight"])
+    if "theatre" in ward_value or "theatre list" in skill_values or "airway competent" in skill_values:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Registrar Oversight"])
+    if "icu" in ward_value or "critical care" in ward_value:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Senior Registrar Oversight"])
+
+    ranked_levels = {rank: level for level, rank in SUPERVISION_LEVEL_RANKS.items()}
+    return ranked_levels.get(base_rank, "Direct Supervision")
+
+
+def _doctor_supervision_rank(doctor: Doctor) -> int:
+    return SUPERVISION_LEVEL_RANKS.get(str(getattr(doctor, "supervision_level", "") or "").strip(), 0)
+
+
+def _doctor_restricted_duties(doctor: Doctor) -> List[str]:
+    return _parse_string_list(getattr(doctor, "restricted_duties", None))
+
+
+def _doctor_meets_supervision_requirement(
+    doctor: Doctor,
+    shift: Optional[ShiftType],
+    department: Optional[str],
+    ward: Optional[str],
+    required_skills: Optional[List[str]],
+) -> bool:
+    required_level = _required_supervision_level(shift, department, ward, required_skills)
+    return _doctor_supervision_rank(doctor) >= SUPERVISION_LEVEL_RANKS.get(required_level, 0)
+
+
+def _doctor_has_blocking_restriction(
+    doctor: Doctor,
+    shift: Optional[ShiftType],
+    department: Optional[str],
+    ward: Optional[str],
+    required_skills: Optional[List[str]],
+) -> bool:
+    blocked_duties = {
+        duty.casefold()
+        for duty in _restricted_duties_for_context(shift, department, ward, required_skills)
+    }
+    if not blocked_duties:
+        return False
+    return any(duty.casefold() in blocked_duties for duty in _doctor_restricted_duties(doctor))
+
+
+def _assignment_context_from_notes(notes: str | None) -> Dict[str, str]:
+    context: Dict[str, str] = {}
+    if not notes:
+        return context
+    for segment in str(notes).split(";"):
+        if ":" not in segment:
+            continue
+        key, value = segment.split(":", 1)
+        normalized_key = key.strip().lower().replace(" ", "_")
+        cleaned_value = value.strip()
+        if cleaned_value:
+            context[normalized_key] = cleaned_value
+    return context
+
 
 class ConstraintValidator:
     """Validates all constraints for a schedule"""
@@ -120,6 +265,55 @@ class ConstraintValidator:
                     })
         
         return violations
+
+    def validate_supervision_restrictions(self, doctor: Doctor, assignments: List[ScheduleAssignment]) -> List[Dict]:
+        violations = []
+        for assignment in assignments:
+            shift_type = self._get_shift_type(assignment.shift_type_id)
+            assignment_context = _assignment_context_from_notes(assignment.notes)
+            department = assignment_context.get("department") or doctor.department or doctor.specialty
+            ward = assignment_context.get("ward") or doctor.ward or "Unassigned Base Ward"
+            required_skills = _parse_string_list(assignment_context.get("required_skills"))
+            if _doctor_meets_supervision_requirement(doctor, shift_type, department, ward, required_skills):
+                continue
+            required_level = _required_supervision_level(shift_type, department, ward, required_skills)
+            violations.append({
+                "type": "SUPERVISION_MISMATCH",
+                "severity": "ERROR",
+                "date": str(assignment.assignment_date),
+                "shift": shift_type.name if shift_type else "Unknown shift",
+                "description": (
+                    f"{doctor.first_name} {doctor.last_name} has supervision level "
+                    f"{doctor.supervision_level or 'Not recorded'}, below the required "
+                    f"{required_level} for {ward} cover."
+                ),
+                "suggested_fix": f"Assign a doctor with at least {required_level} autonomy or add supervised cover.",
+            })
+        return violations
+
+    def validate_restricted_duties(self, doctor: Doctor, assignments: List[ScheduleAssignment]) -> List[Dict]:
+        violations = []
+        for assignment in assignments:
+            shift_type = self._get_shift_type(assignment.shift_type_id)
+            assignment_context = _assignment_context_from_notes(assignment.notes)
+            department = assignment_context.get("department") or doctor.department or doctor.specialty
+            ward = assignment_context.get("ward") or doctor.ward or "Unassigned Base Ward"
+            required_skills = _parse_string_list(assignment_context.get("required_skills"))
+            blocking_duties = _restricted_duties_for_context(shift_type, department, ward, required_skills)
+            if not blocking_duties or not _doctor_has_blocking_restriction(doctor, shift_type, department, ward, required_skills):
+                continue
+            violations.append({
+                "type": "RESTRICTED_DUTY_CONFLICT",
+                "severity": "ERROR",
+                "date": str(assignment.assignment_date),
+                "shift": shift_type.name if shift_type else "Unknown shift",
+                "description": (
+                    f"{doctor.first_name} {doctor.last_name} is restricted from "
+                    f"{', '.join(blocking_duties)} but was assigned to {ward} cover."
+                ),
+                "suggested_fix": "Reassign this shift to a doctor without that restricted-duty flag.",
+            })
+        return violations
     
     def validate_all(
         self,
@@ -136,6 +330,8 @@ class ConstraintValidator:
         
         if doctor:
             all_violations.extend(self.validate_grade_restrictions(doctor.grade, assignments))
+            all_violations.extend(self.validate_supervision_restrictions(doctor, assignments))
+            all_violations.extend(self.validate_restricted_duties(doctor, assignments))
         
         # Calculate compliance score
         error_count = len([v for v in all_violations if v.get("severity") == "ERROR"])
@@ -654,6 +850,8 @@ class SchedulingEngine:
                                     shift,
                                     preferred_grades,
                                     required_skills,
+                                    home_base_key[1],
+                                    home_base_key[2],
                                 )
                                 if doctor:
                                     fill_source = source_name
@@ -693,6 +891,8 @@ class SchedulingEngine:
                             site_indices[site_name],
                             assigned_doctor_ids,
                             assignment_counts_by_doctor,
+                            None,
+                            None,
                             None,
                             None,
                             None,
@@ -835,6 +1035,8 @@ class SchedulingEngine:
         shift: Optional[ShiftType],
         preferred_grades: Optional[List[str]],
         required_skills: Optional[List[str]],
+        department: Optional[str] = None,
+        ward: Optional[str] = None,
     ) -> Optional[Doctor]:
         if not doctors:
             return None
@@ -843,7 +1045,8 @@ class SchedulingEngine:
         candidates = [
             (index, doctor)
             for index, doctor in enumerate(ordered_doctors)
-            if doctor.id not in assigned_doctor_ids and (shift is None or self._shift_allows_grade(shift, doctor))
+            if doctor.id not in assigned_doctor_ids
+            and self._doctor_can_cover_context(doctor, shift, department, ward, required_skills)
         ]
         if not candidates:
             return None
@@ -858,6 +1061,22 @@ class SchedulingEngine:
             ),
         )
         return selected_doctor
+
+    def _doctor_can_cover_context(
+        self,
+        doctor: Doctor,
+        shift: Optional[ShiftType],
+        department: Optional[str],
+        ward: Optional[str],
+        required_skills: Optional[List[str]],
+    ) -> bool:
+        if shift and not self._shift_allows_grade(shift, doctor):
+            return False
+        if not _doctor_meets_supervision_requirement(doctor, shift, department, ward, required_skills):
+            return False
+        if _doctor_has_blocking_restriction(doctor, shift, department, ward, required_skills):
+            return False
+        return True
 
     def _preferred_grade_score(self, doctor: Doctor, preferred_grades: Optional[List[str]]) -> int:
         if not preferred_grades:
@@ -900,7 +1119,13 @@ class SchedulingEngine:
         def pick(*codes: str) -> Optional[ShiftType]:
             for code in codes:
                 shift = shift_types_by_code.get(code)
-                if shift and self._shift_allows_grade(shift, doctor):
+                if shift and self._doctor_can_cover_context(
+                    doctor,
+                    shift,
+                    doctor.department or doctor.specialty,
+                    doctor.ward or "Unassigned Base Ward",
+                    None,
+                ):
                     return shift
             return None
 
@@ -911,7 +1136,14 @@ class SchedulingEngine:
             if day_template not in self._service_templates_for_date(current_date):
                 continue
             shift = shift_types_by_id.get(requirement.shift_type_id)
-            if shift and self._shift_allows_grade(shift, doctor):
+            required_skills = self._required_skills_for_requirement(requirement)
+            if shift and self._doctor_can_cover_context(
+                doctor,
+                shift,
+                home_base_key[1],
+                home_base_key[2],
+                required_skills,
+            ):
                 preferred_requirements.append((int(requirement.required_doctors or 0), shift))
 
         if preferred_requirements:

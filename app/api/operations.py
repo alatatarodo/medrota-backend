@@ -42,6 +42,34 @@ SUPERVISION_LEVEL_OPTIONS = [
     "Independent Practice",
 ]
 
+SUPERVISION_LEVEL_RANKS = {
+    "Direct Supervision": 0,
+    "Close Supervision": 1,
+    "Indirect Supervision": 2,
+    "Registrar Oversight": 3,
+    "Senior Registrar Oversight": 4,
+    "Consultant Available": 5,
+    "Independent Practice": 6,
+}
+
+SHIFT_SUPERVISION_REQUIREMENTS = {
+    "DAYTIME": "Direct Supervision",
+    "MORNING": "Direct Supervision",
+    "EVENING": "Indirect Supervision",
+    "LONG_DAY": "Indirect Supervision",
+    "TWILIGHT": "Registrar Oversight",
+    "NIGHT": "Senior Registrar Oversight",
+    "ONCALL": "Consultant Available",
+}
+
+RESTRICTED_DUTY_OPTIONS = [
+    "Night Resident",
+    "On-Call Lead",
+    "Resus Solo Cover",
+    "Theatre Solo List",
+    "ICU Solo Cover",
+]
+
 GRADE_ORDER = [
     "FY1",
     "FY2",
@@ -266,6 +294,8 @@ def _build_shift_pattern(shift: ShiftType) -> dict:
         "compliance_level": compliance_level,
         "approval_required": approval_required,
         "estimated_bank_rate_per_hour": metadata.get("rate", 50),
+        "minimum_supervision_level": _required_supervision_level_for_context({"code": shift_code}, None, None, []),
+        "blocked_duties": _blocked_duties_for_context({"code": shift_code}, None, None, []),
         "is_night_shift": shift.is_night_shift,
         "is_on_call": shift.is_on_call,
     }
@@ -481,6 +511,68 @@ def _doctor_competencies(doctor: Doctor) -> list[str]:
     return _parse_skill_list(getattr(doctor, "competencies", None))
 
 
+def _doctor_restricted_duties(doctor: Doctor) -> list[str]:
+    return _parse_skill_list(getattr(doctor, "restricted_duties", None))
+
+
+def _required_supervision_level_for_context(shift_pattern: dict, department: str | None, ward: str | None, required_skills: list[str]) -> str:
+    base_level = SHIFT_SUPERVISION_REQUIREMENTS.get(str(shift_pattern.get("code") or "").upper(), "Direct Supervision")
+    base_rank = SUPERVISION_LEVEL_RANKS.get(base_level, 0)
+    department_value = str(department or "").casefold()
+    ward_value = str(ward or "").casefold()
+    skill_values = {skill.casefold() for skill in required_skills}
+
+    if department_value == "emergency department" or "resus" in ward_value or "resus" in skill_values:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Registrar Oversight"])
+    if "theatre" in ward_value or "theatre list" in skill_values or "airway competent" in skill_values:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Registrar Oversight"])
+    if "icu" in ward_value or "critical care" in ward_value:
+        base_rank = max(base_rank, SUPERVISION_LEVEL_RANKS["Senior Registrar Oversight"])
+
+    ranked_levels = {rank: level for level, rank in SUPERVISION_LEVEL_RANKS.items()}
+    return ranked_levels.get(base_rank, "Direct Supervision")
+
+
+def _blocked_duties_for_context(shift_pattern: dict, department: str | None, ward: str | None, required_skills: list[str]) -> list[str]:
+    duties = set()
+    shift_code = str(shift_pattern.get("code") or "").upper()
+    department_value = str(department or "").casefold()
+    ward_value = str(ward or "").casefold()
+    skill_values = {skill.casefold() for skill in required_skills}
+
+    if shift_code == "NIGHT":
+        duties.add("Night Resident")
+    if shift_code == "ONCALL":
+        duties.add("On-Call Lead")
+    if department_value == "emergency department" or "resus" in ward_value or "resus" in skill_values:
+        duties.add("Resus Solo Cover")
+    if "theatre" in ward_value or "theatre list" in skill_values:
+        duties.add("Theatre Solo List")
+    if "icu" in ward_value or "critical care" in ward_value:
+        duties.add("ICU Solo Cover")
+
+    return sorted(duties)
+
+
+def _doctor_meets_supervision_requirement(doctor: Doctor, shift_pattern: dict, department: str | None, ward: str | None, required_skills: list[str]) -> bool:
+    doctor_rank = SUPERVISION_LEVEL_RANKS.get(str(getattr(doctor, "supervision_level", "") or "").strip(), 0)
+    required_rank = SUPERVISION_LEVEL_RANKS.get(
+        _required_supervision_level_for_context(shift_pattern, department, ward, required_skills),
+        0,
+    )
+    return doctor_rank >= required_rank
+
+
+def _doctor_has_blocking_restriction(doctor: Doctor, shift_pattern: dict, department: str | None, ward: str | None, required_skills: list[str]) -> bool:
+    blocked_duties = {
+        duty.casefold()
+        for duty in _blocked_duties_for_context(shift_pattern, department, ward, required_skills)
+    }
+    if not blocked_duties:
+        return False
+    return any(duty.casefold() in blocked_duties for duty in _doctor_restricted_duties(doctor))
+
+
 def _doctor_has_required_skills(doctor: Doctor, required_skills: list[str]) -> bool:
     if not required_skills:
         return True
@@ -523,6 +615,16 @@ def _build_establishment_matrix(
                 grade_distribution = {}
             required_skills = _parse_skill_list(requirement.required_skills)
             missing_skills = [skill for skill in required_skills if home_skill_mix.get(skill, 0) == 0]
+            minimum_supervision_level = _required_supervision_level_for_context(shift_pattern, department, ward, required_skills)
+            blocked_duties = _blocked_duties_for_context(shift_pattern, department, ward, required_skills)
+            supervision_ready_count = len([
+                doctor for doctor in assigned_doctors
+                if _doctor_meets_supervision_requirement(doctor, shift_pattern, department, ward, required_skills)
+            ])
+            restriction_ready_count = len([
+                doctor for doctor in assigned_doctors
+                if not _doctor_has_blocking_restriction(doctor, shift_pattern, department, ward, required_skills)
+            ])
 
             shift_requirements.append({
                 "requirement_id": requirement.id,
@@ -534,6 +636,12 @@ def _build_establishment_matrix(
                 "required_skills": required_skills,
                 "skill_gap_risk": "GAP_RISK" if missing_skills else "ALIGNED",
                 "missing_skills": missing_skills,
+                "minimum_supervision_level": minimum_supervision_level,
+                "blocked_duties": blocked_duties,
+                "supervision_ready_count": supervision_ready_count,
+                "restriction_ready_count": restriction_ready_count,
+                "supervision_gap_risk": "SUPERVISION_RISK" if supervision_ready_count < int(requirement.required_doctors or 0) else "ALIGNED",
+                "restriction_gap_risk": "RESTRICTION_RISK" if restriction_ready_count < int(requirement.required_doctors or 0) else "ALIGNED",
                 "supervising_consultant": requirement.supervising_consultant,
             })
 
@@ -654,6 +762,16 @@ def _build_requirement_shortfalls(
                 doctor for doctor in home_base_doctors
                 if _doctor_has_required_skills(doctor, required_skills)
             ])
+            minimum_supervision_level = _required_supervision_level_for_context(shift_pattern, department, ward, required_skills)
+            supervision_ready_doctors = len([
+                doctor for doctor in home_base_doctors
+                if _doctor_meets_supervision_requirement(doctor, shift_pattern, department, ward, required_skills)
+            ])
+            restriction_ready_doctors = len([
+                doctor for doctor in home_base_doctors
+                if not _doctor_has_blocking_restriction(doctor, shift_pattern, department, ward, required_skills)
+            ])
+            blocked_duties = _blocked_duties_for_context(shift_pattern, department, ward, required_skills)
             shortfalls.append({
                 "site": site,
                 "ward": ward,
@@ -668,7 +786,13 @@ def _build_requirement_shortfalls(
                 "assigned_doctors": assigned_count,
                 "gap_count": gap_count,
                 "matching_home_doctors": matching_home_doctors,
+                "minimum_supervision_level": minimum_supervision_level,
+                "supervision_ready_doctors": supervision_ready_doctors,
+                "blocked_duties": blocked_duties,
+                "restriction_ready_doctors": restriction_ready_doctors,
                 "skill_gap_risk": "GAP_RISK" if required_skills and matching_home_doctors < int(requirement.required_doctors or 0) else "ALIGNED",
+                "supervision_gap_risk": "SUPERVISION_RISK" if supervision_ready_doctors < int(requirement.required_doctors or 0) else "ALIGNED",
+                "restriction_gap_risk": "RESTRICTION_RISK" if restriction_ready_doctors < int(requirement.required_doctors or 0) else "ALIGNED",
                 "approval_status": "TARGET_GAP",
                 "estimated_cost": round(unit_cost * gap_count, 2),
                 "supervising_consultant": requirement.supervising_consultant,
@@ -747,10 +871,13 @@ def _build_compliance_payload(
     shift_patterns: list[dict],
     events: list[DoctorAvailabilityEvent],
     doctors_by_id: dict[str, Doctor],
+    requirement_shortfalls: list[dict],
 ) -> dict:
     shift_patterns_by_id = {pattern["id"]: pattern for pattern in shift_patterns}
     rules = []
     for pattern in shift_patterns:
+        minimum_supervision_level = _required_supervision_level_for_context(pattern, None, None, [])
+        blocked_duties = _blocked_duties_for_context(pattern, None, None, [])
         rules.append({
             "shift_code": pattern["code"],
             "shift_name": pattern["name"],
@@ -759,6 +886,8 @@ def _build_compliance_payload(
             "compliance_level": pattern["compliance_level"],
             "approval_required_for_locum": pattern["approval_required"],
             "booking_rule": "Approval required before attachment" if pattern["approval_required"] else "Can be filled directly from bank pool",
+            "minimum_supervision_level": minimum_supervision_level,
+            "blocked_duties": blocked_duties,
         })
 
     approval_queue = []
@@ -853,6 +982,44 @@ def _build_compliance_payload(
                 "title": f"{request.ward} requires {request.required_grade.value if hasattr(request.required_grade, 'value') else str(request.required_grade)} cover",
                 "detail": governance["governance_note"],
                 "recommended_action": f"Route to {governance['recommended_approver']} and secure cover before shift start" if request.approval_required else "Book internal bank cover",
+                "minimum_supervision_level": _required_supervision_level_for_context(
+                    shift_pattern,
+                    request.department,
+                    request.ward,
+                    [],
+                ),
+                "blocked_duties": _blocked_duties_for_context(shift_pattern, request.department, request.ward, []),
+            })
+
+    for index, shortfall in enumerate(requirement_shortfalls[:8]):
+        if shortfall.get("supervision_gap_risk") == "SUPERVISION_RISK":
+            risk_register.append({
+                "id": f"supervision-{index}-{shortfall['site']}-{shortfall['ward']}",
+                "severity": "High" if shortfall.get("required_grade") in {"Registrar", "Consultant"} else "Medium",
+                "site": shortfall["site"],
+                "title": f"{shortfall['ward']} needs more autonomous cover",
+                "detail": (
+                    f"{shortfall['shift_name']} on {shortfall['date']} requires {shortfall.get('minimum_supervision_level')} "
+                    f"but only {shortfall.get('supervision_ready_doctors', 0)} home-base doctors currently meet that threshold."
+                ),
+                "recommended_action": "Escalate to senior-grade cover or re-balance ward assignments before publishing.",
+                "minimum_supervision_level": shortfall.get("minimum_supervision_level"),
+                "blocked_duties": shortfall.get("blocked_duties", []),
+            })
+        if shortfall.get("restriction_gap_risk") == "RESTRICTION_RISK":
+            blocked = ", ".join(shortfall.get("blocked_duties", [])[:3]) or "restricted duties"
+            risk_register.append({
+                "id": f"restriction-{index}-{shortfall['site']}-{shortfall['ward']}",
+                "severity": "Medium",
+                "site": shortfall["site"],
+                "title": f"{shortfall['ward']} is constrained by restricted-duty flags",
+                "detail": (
+                    f"{shortfall['shift_name']} on {shortfall['date']} is limited by duties such as {blocked}. "
+                    f"Only {shortfall.get('restriction_ready_doctors', 0)} home-base doctors are currently restriction-safe."
+                ),
+                "recommended_action": "Use the doctor directory to identify unrestricted cover or open a targeted bank request.",
+                "minimum_supervision_level": shortfall.get("minimum_supervision_level"),
+                "blocked_duties": shortfall.get("blocked_duties", []),
             })
 
     for event in events:
@@ -948,6 +1115,22 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
             "title": "Competency-led gaps need targeted cover",
             "detail": f"{len(skill_gap_shortfalls)} open ward targets need skills such as {skills}.",
             "impact": "Skills Risk",
+        })
+
+    supervision_gap_shortfalls = [item for item in requirement_shortfalls if item.get("supervision_gap_risk") == "SUPERVISION_RISK"]
+    if supervision_gap_shortfalls:
+        actions.append({
+            "title": "Supervision-sensitive cover needs escalation",
+            "detail": f"{len(supervision_gap_shortfalls)} target gaps need doctors with higher autonomous cover levels.",
+            "impact": "Supervision Risk",
+        })
+
+    restriction_gap_shortfalls = [item for item in requirement_shortfalls if item.get("restriction_gap_risk") == "RESTRICTION_RISK"]
+    if restriction_gap_shortfalls:
+        actions.append({
+            "title": "Restricted-duty conflicts are limiting fill rates",
+            "detail": f"{len(restriction_gap_shortfalls)} target gaps are constrained by restricted-duty flags such as night or resus cover.",
+            "impact": "Restriction Risk",
         })
 
     for site_summary in coverage_pressure:
@@ -1176,13 +1359,14 @@ def build_operations_workspace_payload(db: Session) -> dict:
         "leave_events": [_serialize_event(event, doctors_by_id) for event in events],
         "locum_requests": [_serialize_locum_request(request, shift_patterns_by_id) for request in locum_requests],
         "activity_feed": [_serialize_audit_log(entry) for entry in audit_logs],
-        "compliance": _build_compliance_payload(locum_requests, shift_patterns, events, doctors_by_id),
+        "compliance": _build_compliance_payload(locum_requests, shift_patterns, events, doctors_by_id, requirement_shortfalls),
         "reference_data": {
             "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
             "department_options": sorted({doctor.department for doctor in doctors if doctor.department}),
             "ward_options": sorted({doctor.ward for doctor in doctors if doctor.ward}),
             "competency_options": sorted({skill for doctor in doctors for skill in _doctor_competencies(doctor)}),
             "supervision_levels": SUPERVISION_LEVEL_OPTIONS,
+            "restricted_duty_options": RESTRICTED_DUTY_OPTIONS,
             "doctor_grades": [grade.value for grade in DoctorGrade],
             "availability_event_types": [
                 {"value": event_type.value, "label": EVENT_LABELS.get(event_type, event_type.value.replace("_", " ").title())}
