@@ -162,6 +162,10 @@ class ScheduleGenerationStatus(BaseModel):
     poll_url: Optional[str] = None
 
 
+class SchedulePublicationAction(BaseModel):
+    actor_name: str
+
+
 # Report Schemas
 class ComplianceReportDetail(BaseModel):
     doctor_id: str

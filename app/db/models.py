@@ -181,6 +181,11 @@ class GeneratedSchedule(Base):
     algorithm_version = Column(String(20))
     total_doctors = Column(Integer)
     generated_successfully = Column(Boolean)
+    publication_status = Column(String(20), default="DRAFT")
+    published_at = Column(DateTime)
+    published_by = Column(String(100))
+    archived_at = Column(DateTime)
+    archived_by = Column(String(100))
     compliance_score = Column(Float)  # 0-100
     fairness_score = Column(Float)    # 0-100
     exception_count = Column(Integer, default=0)

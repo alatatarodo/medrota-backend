@@ -17,6 +17,7 @@ def ensure_schema_updates():
     availability_columns = {column["name"] for column in inspector.get_columns("doctor_availability_events")}
     locum_columns = {column["name"] for column in inspector.get_columns("locum_requests")}
     service_requirement_columns = {column["name"] for column in inspector.get_columns("service_requirements")}
+    schedule_columns = {column["name"] for column in inspector.get_columns("generated_schedules")}
 
     if "hospital_site" not in doctor_columns:
         with engine.begin() as connection:
@@ -67,6 +68,23 @@ def ensure_schema_updates():
 
         if "supervising_consultant" not in service_requirement_columns:
             connection.execute(text("ALTER TABLE service_requirements ADD COLUMN supervising_consultant VARCHAR(120)"))
+
+        if "publication_status" not in schedule_columns:
+            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN publication_status VARCHAR(20) DEFAULT 'DRAFT'"))
+        if "published_at" not in schedule_columns:
+            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN published_at DATETIME"))
+        if "published_by" not in schedule_columns:
+            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN published_by VARCHAR(100)"))
+        if "archived_at" not in schedule_columns:
+            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN archived_at DATETIME"))
+        if "archived_by" not in schedule_columns:
+            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN archived_by VARCHAR(100)"))
+        connection.execute(
+            text(
+                "UPDATE generated_schedules "
+                "SET publication_status = COALESCE(publication_status, 'DRAFT')"
+            )
+        )
 
 
 ensure_schema_updates()

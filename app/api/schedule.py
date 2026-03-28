@@ -10,7 +10,13 @@ import json
 import uuid
 from app.db.database import get_db, SessionLocal
 from app.db.models import GeneratedSchedule, ScheduleAssignment, ComplianceViolation, FairnessMetric, Doctor
-from app.core.schemas import ScheduleGenerationRequest, ScheduleGenerationStatus, ComplianceReportDetail, ScheduleAssignmentResponse
+from app.core.schemas import (
+    ScheduleGenerationRequest,
+    ScheduleGenerationStatus,
+    ComplianceReportDetail,
+    ScheduleAssignmentResponse,
+    SchedulePublicationAction,
+)
 from app.scheduler.engine import SchedulingEngine
 
 router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
@@ -147,6 +153,13 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
         "selected_hospital_sites": notes.get("hospital_sites", []),
         "error": notes.get("error"),
         "progress": progress,
+        "publication": {
+            "status": (schedule.publication_status or "DRAFT").upper(),
+            "published_at": schedule.published_at.isoformat() if schedule.published_at else None,
+            "published_by": schedule.published_by,
+            "archived_at": schedule.archived_at.isoformat() if schedule.archived_at else None,
+            "archived_by": schedule.archived_by,
+        },
         "metrics": {
             "total_doctors": schedule.total_doctors,
             "compliance_score": schedule.compliance_score,
@@ -225,6 +238,11 @@ def _build_schedule_bundle(schedule: GeneratedSchedule, db: Session) -> dict:
             "algorithm_version": schedule.algorithm_version,
             "total_doctors": schedule.total_doctors,
             "generated_successfully": schedule.generated_successfully,
+            "publication_status": schedule.publication_status,
+            "published_at": schedule.published_at.isoformat() if schedule.published_at else None,
+            "published_by": schedule.published_by,
+            "archived_at": schedule.archived_at.isoformat() if schedule.archived_at else None,
+            "archived_by": schedule.archived_by,
             "compliance_score": schedule.compliance_score,
             "fairness_score": schedule.fairness_score,
             "exception_count": schedule.exception_count,
@@ -280,6 +298,10 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
 
     latest_schedule = schedules[0] if schedules else None
     latest_schedule_summary = None
+    latest_published_schedule = next(
+        (schedule for schedule in schedules if (schedule.publication_status or "DRAFT").upper() == "PUBLISHED"),
+        None,
+    )
 
     if latest_schedule:
         latest_schedule_summary = _build_schedule_summary(latest_schedule, db)
@@ -289,6 +311,7 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         "doctor_counts_by_site": dict(doctor_counts_by_site),
         "generated_schedule_count": len(schedules),
         "latest_schedule": latest_schedule_summary,
+        "latest_published_schedule": _build_schedule_summary(latest_published_schedule, db) if latest_published_schedule else None,
     }
 
 
@@ -328,6 +351,7 @@ def generate_schedule(
         algorithm_version="1.0.0",
         generated_successfully=False,
         total_doctors=0,
+        publication_status="DRAFT",
         notes=json.dumps({
             "status": "processing",
             "hospital_sites": request.hospital_sites or [],
@@ -369,6 +393,56 @@ def get_schedule(schedule_id: str, db: Session = Depends(get_db)):
     if not schedule:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
+    return _build_schedule_summary(schedule, db)
+
+
+@router.post("/{schedule_id}/publish", response_model=dict)
+def publish_schedule(schedule_id: str, payload: SchedulePublicationAction, db: Session = Depends(get_db)):
+    schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if not schedule.generated_successfully:
+        raise HTTPException(status_code=400, detail="Only completed schedules can be published")
+
+    schedule.publication_status = "PUBLISHED"
+    schedule.published_at = datetime.now(timezone.utc)
+    schedule.published_by = payload.actor_name
+    schedule.archived_at = None
+    schedule.archived_by = None
+    db.commit()
+    db.refresh(schedule)
+    return _build_schedule_summary(schedule, db)
+
+
+@router.post("/{schedule_id}/archive", response_model=dict)
+def archive_schedule(schedule_id: str, payload: SchedulePublicationAction, db: Session = Depends(get_db)):
+    schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if not schedule.generated_successfully:
+        raise HTTPException(status_code=400, detail="Only completed schedules can be archived")
+
+    schedule.publication_status = "ARCHIVED"
+    schedule.archived_at = datetime.now(timezone.utc)
+    schedule.archived_by = payload.actor_name
+    db.commit()
+    db.refresh(schedule)
+    return _build_schedule_summary(schedule, db)
+
+
+@router.post("/{schedule_id}/mark-draft", response_model=dict)
+def mark_schedule_draft(schedule_id: str, payload: SchedulePublicationAction, db: Session = Depends(get_db)):
+    schedule = db.query(GeneratedSchedule).filter(GeneratedSchedule.id == schedule_id).first()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    schedule.publication_status = "DRAFT"
+    schedule.published_at = None
+    schedule.published_by = payload.actor_name
+    schedule.archived_at = None
+    schedule.archived_by = None
+    db.commit()
+    db.refresh(schedule)
     return _build_schedule_summary(schedule, db)
 
 
@@ -671,6 +745,11 @@ def import_schedule_bundle(bundle: dict, db: Session = Depends(get_db)):
         algorithm_version=schedule_payload.get("algorithm_version"),
         total_doctors=schedule_payload.get("total_doctors"),
         generated_successfully=schedule_payload.get("generated_successfully"),
+        publication_status=schedule_payload.get("publication_status") or "DRAFT",
+        published_at=datetime.fromisoformat(schedule_payload["published_at"]) if schedule_payload.get("published_at") else None,
+        published_by=schedule_payload.get("published_by"),
+        archived_at=datetime.fromisoformat(schedule_payload["archived_at"]) if schedule_payload.get("archived_at") else None,
+        archived_by=schedule_payload.get("archived_by"),
         compliance_score=schedule_payload.get("compliance_score"),
         fairness_score=schedule_payload.get("fairness_score"),
         exception_count=schedule_payload.get("exception_count", 0),
