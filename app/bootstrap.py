@@ -276,6 +276,120 @@ DAY_TYPE_ESTABLISHMENT_RULES = {
     },
 }
 
+GRADE_COMPETENCY_BASES = {
+    DoctorGrade.FY1: ["BLS", "Ward Cover", "Clerking", "Discharge Support"],
+    DoctorGrade.FY2: ["BLS", "ALS", "Ward Cover", "Clerking", "Acute Take", "Long Day Ready"],
+    DoctorGrade.SHO: ["ALS", "Ward Cover", "Acute Take", "Night Resident"],
+    DoctorGrade.ST1: ["ALS", "Ward Cover", "Acute Take", "Night Resident"],
+    DoctorGrade.ST2: ["ALS", "Ward Cover", "Acute Take", "Night Resident"],
+    DoctorGrade.ST3: ["ALS", "Acute Take", "Night Resident", "Independent Nights"],
+    DoctorGrade.ST4: ["ALS", "Acute Take", "Night Resident", "Independent Nights", "On-Call Lead"],
+    DoctorGrade.ST5: ["ALS", "Acute Take", "Night Resident", "Independent Nights", "On-Call Lead"],
+    DoctorGrade.ST6: ["ALS", "Independent Nights", "On-Call Lead", "Consultant Oversight"],
+    DoctorGrade.ST7: ["ALS", "Independent Nights", "On-Call Lead", "Consultant Oversight"],
+    DoctorGrade.ST8: ["ALS", "Independent Nights", "On-Call Lead", "Consultant Oversight"],
+    DoctorGrade.REGISTRAR: ["ALS", "Independent Nights", "On-Call Lead", "Medical Registrar"],
+    DoctorGrade.CONSULTANT: ["ALS", "Consultant Oversight", "On-Call Lead", "Supervision"],
+}
+
+SPECIALTY_COMPETENCY_BASES = {
+    "Medicine": ["AMU Cover", "Medical Take"],
+    "Emergency Medicine": ["ED Majors", "ED Minors", "Resus", "SDEC"],
+    "General Surgery": ["Surgical Take", "Post-Op Review", "Theatre Assist"],
+    "Anaesthetics": ["Airway Competent", "Theatre List", "Critical Care"],
+}
+
+DEPARTMENT_SHIFT_SKILLS = {
+    "General Medicine": {
+        "MORNING": ["Ward Cover", "Acute Take"],
+        "EVENING": ["Ward Cover", "Acute Take"],
+        "TWILIGHT": ["Ward Cover", "Night Resident"],
+        "NIGHT": ["Night Resident", "Acute Take"],
+    },
+    "Emergency Department": {
+        "MORNING": ["ED Majors", "Resus"],
+        "EVENING": ["ED Majors", "ED Minors"],
+        "TWILIGHT": ["ED Majors", "Resus", "Night Resident"],
+        "NIGHT": ["Resus", "Night Resident"],
+    },
+    "General Surgery": {
+        "MORNING": ["Surgical Take", "Post-Op Review"],
+        "EVENING": ["Surgical Take", "Ward Cover"],
+        "NIGHT": ["Surgical Take", "Night Resident"],
+    },
+    "Anaesthetics & Theatres": {
+        "MORNING": ["Theatre List", "Airway Competent"],
+        "LONG_DAY": ["Theatre List", "Airway Competent"],
+        "ONCALL": ["Airway Competent", "Critical Care", "On-Call Lead"],
+        "NIGHT": ["Airway Competent", "Critical Care"],
+    },
+}
+
+
+def _normalize_skill_list(raw_values) -> list[str]:
+    if not raw_values:
+        return []
+    if isinstance(raw_values, (list, tuple, set)):
+        values = list(raw_values)
+    elif hasattr(raw_values, "__iter__") and not isinstance(raw_values, (str, bytes)):
+        values = list(raw_values)
+    else:
+        values = [raw_values]
+    seen = set()
+    normalized = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _ward_competencies(ward: str) -> list[str]:
+    ward_name = str(ward or "").lower()
+    competency_map = [
+        (("amu", "acute medical"), "AMU Cover"),
+        (("frailty",), "Frailty Assessment"),
+        (("respiratory",), "Respiratory Support"),
+        (("majors",), "ED Majors"),
+        (("minors", "minor injuries"), "ED Minors"),
+        (("resus",), "Resus"),
+        (("sdec", "same day emergency care", "ambulatory"), "SDEC"),
+        (("surgical",), "Surgical Take"),
+        (("theatre", "recovery", "cepod"), "Theatre List"),
+        (("critical care", "surgical critical care"), "Critical Care"),
+    ]
+    return _normalize_skill_list(
+        competency
+        for keywords, competency in competency_map
+        if any(keyword in ward_name for keyword in keywords)
+    )
+
+
+def _doctor_competencies(grade: DoctorGrade, specialty: str, department: str, ward: str) -> list[str]:
+    competencies = []
+    competencies.extend(GRADE_COMPETENCY_BASES.get(grade, []))
+    competencies.extend(SPECIALTY_COMPETENCY_BASES.get(specialty, []))
+    competencies.extend(_ward_competencies(ward))
+    if department == "Emergency Department" and grade in {DoctorGrade.REGISTRAR, DoctorGrade.CONSULTANT, DoctorGrade.ST6, DoctorGrade.ST7, DoctorGrade.ST8}:
+        competencies.append("Trauma Assessment")
+    if department == "General Medicine" and grade in {DoctorGrade.REGISTRAR, DoctorGrade.CONSULTANT}:
+        competencies.append("Medical Registrar")
+    if grade == DoctorGrade.CONSULTANT:
+        competencies.append("Consultant Oversight")
+    return _normalize_skill_list(competencies)
+
+
+def _requirement_skills(department: str, shift_code: str, ward: str) -> list[str]:
+    skills = []
+    skills.extend(DEPARTMENT_SHIFT_SKILLS.get(department, {}).get(shift_code, []))
+    skills.extend(_ward_competencies(ward))
+    return _normalize_skill_list(skills)
+
 
 def _doctor_identity(sequence: int) -> tuple[str, str, str]:
     first_name = FIRST_NAMES[(sequence - 1) % len(FIRST_NAMES)]
@@ -352,6 +466,10 @@ def _backfill_seeded_doctor_profiles(db: Session) -> None:
         if not doctor.roster_role:
             doctor.roster_role = profile["roster_role"]
             updated = True
+        expected_competencies = _doctor_competencies(doctor.grade, doctor.specialty, doctor.department, doctor.ward)
+        if not doctor.competencies:
+            doctor.competencies = json.dumps(expected_competencies)
+            updated = True
 
     if updated:
         db.commit()
@@ -386,6 +504,7 @@ def _seed_doctors_and_contracts(db: Session) -> None:
                 specialty=specialty,
                 department=home_assignment["department"],
                 ward=home_assignment["ward"],
+                competencies=json.dumps(_doctor_competencies(grade, specialty, home_assignment["department"], home_assignment["ward"])),
                 employment_type=profile["employment_type"],
                 training_stage=profile["training_stage"],
                 roster_role=profile["roster_role"],
@@ -508,6 +627,7 @@ def _seed_service_requirements(db: Session, shifts_by_code: dict[str, ShiftType]
                             shift_type_id=shift.id,
                             required_doctors=rule["required_doctors"],
                             grade_distribution=json.dumps(rule["grade_distribution"]),
+                            required_skills=json.dumps(_requirement_skills(department, rule["shift_code"], ward)),
                             supervising_consultant=SUPERVISING_CONSULTANT_BY_DEPARTMENT.get(department),
                         )
                     )
@@ -529,6 +649,13 @@ def _backfill_service_requirement_templates(db: Session, shifts_by_code: dict[st
         consultant_role = SUPERVISING_CONSULTANT_BY_DEPARTMENT.get(department)
         if consultant_role and not requirement.supervising_consultant:
             requirement.supervising_consultant = consultant_role
+            db.add(requirement)
+            changed = True
+        if not requirement.required_skills:
+            shift = shifts_by_code.get(next((code for code, shift in shifts_by_code.items() if shift.id == requirement.shift_type_id), ""))
+            shift_code = shift.code if shift else "MORNING"
+            _, _, ward = (str(requirement.ward_or_clinic or "").split("::") + ["Unknown", "Unknown", "Unknown"])[:3]
+            requirement.required_skills = json.dumps(_requirement_skills(department, shift_code, ward))
             db.add(requirement)
             changed = True
 
@@ -555,6 +682,7 @@ def _backfill_service_requirement_templates(db: Session, shifts_by_code: dict[st
                                 shift_type_id=shift.id,
                                 required_doctors=rule["required_doctors"],
                                 grade_distribution=json.dumps(rule["grade_distribution"]),
+                                required_skills=json.dumps(_requirement_skills(department, rule["shift_code"], ward)),
                                 supervising_consultant=consultant_role,
                             )
                         )

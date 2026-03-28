@@ -34,6 +34,8 @@ def ensure_schema_updates():
             connection.execute(text("ALTER TABLE doctors ADD COLUMN title VARCHAR(20) NOT NULL DEFAULT 'Dr'"))
         if "preferred_name" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN preferred_name VARCHAR(100)"))
+        if "competencies" not in doctor_columns:
+            connection.execute(text("ALTER TABLE doctors ADD COLUMN competencies TEXT"))
         if "employment_type" not in doctor_columns:
             connection.execute(text("ALTER TABLE doctors ADD COLUMN employment_type VARCHAR(50) NOT NULL DEFAULT 'Substantive'"))
         if "department" not in doctor_columns:
@@ -68,6 +70,8 @@ def ensure_schema_updates():
 
         if "supervising_consultant" not in service_requirement_columns:
             connection.execute(text("ALTER TABLE service_requirements ADD COLUMN supervising_consultant VARCHAR(120)"))
+        if "required_skills" not in service_requirement_columns:
+            connection.execute(text("ALTER TABLE service_requirements ADD COLUMN required_skills TEXT"))
 
         if "publication_status" not in schedule_columns:
             connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN publication_status VARCHAR(20) DEFAULT 'DRAFT'"))

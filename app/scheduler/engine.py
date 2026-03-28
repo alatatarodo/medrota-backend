@@ -635,6 +635,7 @@ class SchedulingEngine:
                         required_count = int(requirement.required_doctors or 0)
                         slots_to_fill = min(required_count, daily_site_quota - len(assigned_doctor_ids))
                         filled_slots = 0
+                        required_skills = self._required_skills_for_requirement(requirement)
 
                         while filled_slots < slots_to_fill:
                             doctor = None
@@ -652,6 +653,7 @@ class SchedulingEngine:
                                     assignment_counts_by_doctor,
                                     shift,
                                     preferred_grades,
+                                    required_skills,
                                 )
                                 if doctor:
                                     fill_source = source_name
@@ -677,6 +679,7 @@ class SchedulingEngine:
                                     f"Department: {home_base_key[1]}; "
                                     f"Ward: {home_base_key[2]}; "
                                     f"Day template: {requirement.day_of_week or 'ALL'}; "
+                                    f"Required skills: {', '.join(required_skills) if required_skills else 'None'}; "
                                     f"Fill source: {fill_source}"
                                 ),
                             ))
@@ -690,6 +693,7 @@ class SchedulingEngine:
                             site_indices[site_name],
                             assigned_doctor_ids,
                             assignment_counts_by_doctor,
+                            None,
                             None,
                             None,
                         )
@@ -768,6 +772,43 @@ class SchedulingEngine:
             grade_distribution = {}
         return sorted(grade_distribution.keys(), key=self._grade_priority, reverse=True)
 
+    def _parse_skill_list(self, raw_value) -> List[str]:
+        if not raw_value:
+            return []
+        if isinstance(raw_value, list):
+            values = raw_value
+        else:
+            try:
+                values = json.loads(raw_value)
+            except (TypeError, json.JSONDecodeError):
+                values = str(raw_value).split(",")
+        seen = set()
+        normalized = []
+        for value in values:
+            cleaned = " ".join(str(value or "").strip().split())
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(cleaned)
+        return normalized
+
+    def _required_skills_for_requirement(self, requirement: ServiceRequirement) -> List[str]:
+        return self._parse_skill_list(requirement.required_skills)
+
+    def _doctor_skills(self, doctor: Doctor) -> List[str]:
+        return self._parse_skill_list(getattr(doctor, "competencies", None))
+
+    def _doctor_skill_match(self, doctor: Doctor, required_skills: Optional[List[str]]) -> Tuple[int, int]:
+        if not required_skills:
+            return (0, 0)
+        doctor_skills = {skill.casefold() for skill in self._doctor_skills(doctor)}
+        matched = sum(1 for skill in required_skills if skill.casefold() in doctor_skills)
+        missing = len(required_skills) - matched
+        return (missing, -matched)
+
     def _grade_priority(self, grade: str) -> int:
         ordered_grades = [
             "FY1", "FY2", "SHO", "ST1", "ST2", "ST3", "ST4", "ST5",
@@ -793,6 +834,7 @@ class SchedulingEngine:
         assignment_counts_by_doctor: Dict[str, int],
         shift: Optional[ShiftType],
         preferred_grades: Optional[List[str]],
+        required_skills: Optional[List[str]],
     ) -> Optional[Doctor]:
         if not doctors:
             return None
@@ -809,6 +851,7 @@ class SchedulingEngine:
         _, selected_doctor = min(
             candidates,
             key=lambda item: (
+                self._doctor_skill_match(item[1], required_skills),
                 self._preferred_grade_score(item[1], preferred_grades),
                 assignment_counts_by_doctor[item[1].id],
                 item[0],

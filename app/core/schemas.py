@@ -22,6 +22,7 @@ class DoctorCreate(BaseModel):
     specialty: str
     department: Optional[str] = None
     ward: Optional[str] = None
+    competencies: List[str] = Field(default_factory=list)
     employment_type: Optional[str] = "Substantive"
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -35,6 +36,7 @@ class DoctorUpdate(BaseModel):
     specialty: Optional[str] = None
     department: Optional[str] = None
     ward: Optional[str] = None
+    competencies: Optional[List[str]] = None
     employment_type: Optional[str] = None
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -53,6 +55,7 @@ class DoctorResponse(BaseModel):
     specialty: str
     department: Optional[str] = None
     ward: Optional[str] = None
+    competencies: List[str] = Field(default_factory=list)
     employment_type: str
     training_stage: Optional[str] = None
     roster_role: Optional[str] = None
@@ -270,6 +273,7 @@ class ServiceRequirementCreate(BaseModel):
     day_of_week: str = "ALL"
     required_doctors: int = Field(default=1, ge=0, le=20)
     grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    required_skills: List[str] = Field(default_factory=list)
     supervising_consultant: Optional[str] = None
     created_by: Optional[str] = None
     note: Optional[str] = None
@@ -279,6 +283,7 @@ class ServiceRequirementUpdate(BaseModel):
     day_of_week: str = "ALL"
     required_doctors: int = Field(default=1, ge=0, le=20)
     grade_distribution: Dict[str, int] = Field(default_factory=dict)
+    required_skills: List[str] = Field(default_factory=list)
     supervising_consultant: Optional[str] = None
     updated_by: Optional[str] = None
     note: Optional[str] = None

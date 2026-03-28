@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, status, HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+import json
 import uuid
 from app.db.database import get_db
 from app.db.models import Doctor, Contract, DoctorGrade
@@ -40,6 +41,52 @@ def _doctor_defaults(payload: DoctorCreate | None = None) -> dict:
     }
 
 
+def _normalize_competencies(raw_competencies) -> list[str]:
+    if not raw_competencies:
+        return []
+    if isinstance(raw_competencies, list):
+        values = raw_competencies
+    else:
+        try:
+            values = json.loads(raw_competencies)
+        except (TypeError, json.JSONDecodeError):
+            values = str(raw_competencies).split(",")
+    seen = set()
+    normalized = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _serialize_doctor(doctor: Doctor) -> dict:
+    return {
+        "id": doctor.id,
+        "gmc_number": doctor.gmc_number,
+        "title": doctor.title or "Dr",
+        "first_name": doctor.first_name,
+        "preferred_name": doctor.preferred_name,
+        "last_name": doctor.last_name,
+        "email": doctor.email,
+        "grade": doctor.grade,
+        "specialty": doctor.specialty,
+        "department": doctor.department,
+        "ward": doctor.ward,
+        "competencies": _normalize_competencies(doctor.competencies),
+        "employment_type": doctor.employment_type,
+        "training_stage": doctor.training_stage,
+        "roster_role": doctor.roster_role,
+        "hospital_site": doctor.hospital_site,
+        "created_at": doctor.created_at,
+    }
+
+
 @router.post("/", response_model=DoctorResponse, status_code=status.HTTP_201_CREATED)
 def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
     """Create a new doctor record"""
@@ -63,6 +110,7 @@ def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
         specialty=doctor.specialty,
         department=defaults["department"],
         ward=defaults["ward"],
+        competencies=json.dumps(_normalize_competencies(doctor.competencies)),
         employment_type=defaults["employment_type"],
         training_stage=defaults["training_stage"],
         roster_role=defaults["roster_role"],
@@ -72,7 +120,7 @@ def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
     db.add(db_doctor)
     db.commit()
     db.refresh(db_doctor)
-    return db_doctor
+    return _serialize_doctor(db_doctor)
 
 
 @router.get("/", response_model=list[DoctorResponse])
@@ -83,6 +131,7 @@ def list_doctors(
     grade: DoctorGrade = None,
     department: str = None,
     ward: str = None,
+    competency: str = None,
     search: str = None,
     db: Session = Depends(get_db)
 ):
@@ -101,6 +150,10 @@ def list_doctors(
     if ward:
         query = query.filter(Doctor.ward == ward)
 
+    if competency:
+        competency_term = f"%{competency.strip()}%"
+        query = query.filter(Doctor.competencies.ilike(competency_term))
+
     if search:
         search_term = f"%{search.strip()}%"
         query = query.filter(
@@ -114,11 +167,12 @@ def list_doctors(
                 Doctor.email.ilike(search_term),
                 Doctor.department.ilike(search_term),
                 Doctor.ward.ilike(search_term),
+                Doctor.competencies.ilike(search_term),
             )
         )
 
     doctors = query.offset(skip).limit(limit).all()
-    return doctors
+    return [_serialize_doctor(doctor) for doctor in doctors]
 
 
 @router.get("/{doctor_id}", response_model=DoctorResponse)
@@ -127,7 +181,7 @@ def get_doctor(doctor_id: str, db: Session = Depends(get_db)):
     doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
     if not doctor:
         raise HTTPException(status_code=404, detail="Doctor not found")
-    return doctor
+    return _serialize_doctor(doctor)
 
 
 @router.post("/batch-import", response_model=ImportResponse)
@@ -171,6 +225,7 @@ def batch_import_doctors(payload: BatchDoctorImport, db: Session = Depends(get_d
                     specialty=doctor_data.specialty,
                     department=defaults["department"],
                     ward=defaults["ward"],
+                    competencies=json.dumps(_normalize_competencies(doctor_data.competencies)),
                     employment_type=defaults["employment_type"],
                     training_stage=defaults["training_stage"],
                     roster_role=defaults["roster_role"],

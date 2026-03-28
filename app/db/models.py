@@ -81,6 +81,7 @@ class Doctor(Base):
     specialty = Column(String(100), nullable=False)
     department = Column(String(100))
     ward = Column(String(100))
+    competencies = Column(Text)
     employment_type = Column(String(50), nullable=False, default="Substantive")
     training_stage = Column(String(100))
     roster_role = Column(String(100))
@@ -167,6 +168,7 @@ class ServiceRequirement(Base):
     shift_type_id = Column(String(36), ForeignKey("shift_types.id"))
     required_doctors = Column(Integer, nullable=False)
     grade_distribution = Column(Text)  # JSON string of grade requirements
+    required_skills = Column(Text)  # JSON string of required competencies
     supervising_consultant = Column(String(120))
     created_at = Column(DateTime, default=func.now())
 

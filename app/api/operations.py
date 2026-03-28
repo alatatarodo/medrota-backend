@@ -439,6 +439,45 @@ def _sanitize_grade_distribution(raw_distribution: dict | None) -> dict[str, int
     return sanitized_distribution
 
 
+def _parse_skill_list(raw_value) -> list[str]:
+    if not raw_value:
+        return []
+    if isinstance(raw_value, list):
+        values = raw_value
+    else:
+        try:
+            values = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            values = str(raw_value).split(",")
+    seen = set()
+    normalized = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _sanitize_skill_list(raw_skills: list[str] | None) -> list[str]:
+    return _parse_skill_list(raw_skills or [])
+
+
+def _doctor_competencies(doctor: Doctor) -> list[str]:
+    return _parse_skill_list(getattr(doctor, "competencies", None))
+
+
+def _doctor_has_required_skills(doctor: Doctor, required_skills: list[str]) -> bool:
+    if not required_skills:
+        return True
+    normalized_doctor_skills = {skill.casefold() for skill in _doctor_competencies(doctor)}
+    return all(skill.casefold() in normalized_doctor_skills for skill in required_skills)
+
+
 def _build_establishment_matrix(
     doctors: list[Doctor],
     service_requirements: list[ServiceRequirement],
@@ -458,9 +497,12 @@ def _build_establishment_matrix(
         site, department, ward = home_base
         assigned_doctors = doctors_by_home_base.get(home_base, [])
         home_grade_mix = defaultdict(int)
+        home_skill_mix = defaultdict(int)
         for doctor in assigned_doctors:
             grade_key = doctor.grade.value if hasattr(doctor.grade, "value") else str(doctor.grade)
             home_grade_mix[grade_key] += 1
+            for skill in _doctor_competencies(doctor):
+                home_skill_mix[skill] += 1
 
         shift_requirements = []
         for requirement in requirement_rows:
@@ -469,6 +511,8 @@ def _build_establishment_matrix(
                 grade_distribution = json.loads(requirement.grade_distribution or "{}")
             except (TypeError, json.JSONDecodeError):
                 grade_distribution = {}
+            required_skills = _parse_skill_list(requirement.required_skills)
+            missing_skills = [skill for skill in required_skills if home_skill_mix.get(skill, 0) == 0]
 
             shift_requirements.append({
                 "requirement_id": requirement.id,
@@ -477,6 +521,9 @@ def _build_establishment_matrix(
                 "day_of_week": _normalize_day_template(requirement.day_of_week),
                 "required_doctors": requirement.required_doctors,
                 "grade_distribution": grade_distribution,
+                "required_skills": required_skills,
+                "skill_gap_risk": "GAP_RISK" if missing_skills else "ALIGNED",
+                "missing_skills": missing_skills,
                 "supervising_consultant": requirement.supervising_consultant,
             })
 
@@ -496,6 +543,7 @@ def _build_establishment_matrix(
             "core_requirement": core_requirement,
             "pressure_level": pressure_level,
             "home_grade_mix": dict(home_grade_mix),
+            "home_competencies": sorted(home_skill_mix.keys()),
             "supervising_consultants": sorted({item["supervising_consultant"] for item in shift_requirements if item.get("supervising_consultant")}),
             "shift_requirements": sorted(
                 shift_requirements,
@@ -540,6 +588,9 @@ def _build_requirement_shortfalls(
     today = date.today()
     window_end = today + timedelta(days=6)
     assignment_counts = defaultdict(int)
+    doctors_by_home_base = defaultdict(list)
+    for doctor in doctors_by_id.values():
+        doctors_by_home_base[(doctor.hospital_site, doctor.department or doctor.specialty, doctor.ward or "Unassigned Base Ward")].append(doctor)
 
     if latest_schedule:
         assignments = db.query(ScheduleAssignment).filter(
@@ -574,6 +625,7 @@ def _build_requirement_shortfalls(
                 grade_distribution = json.loads(requirement.grade_distribution or "{}")
             except (TypeError, json.JSONDecodeError):
                 grade_distribution = {}
+            required_skills = _parse_skill_list(requirement.required_skills)
             assigned_count = assignment_counts[(
                 current_date.isoformat(),
                 site,
@@ -587,6 +639,11 @@ def _build_requirement_shortfalls(
 
             required_grade = _resolve_requirement_grade(requirement, shift_pattern, grade_distribution)
             unit_cost = _estimate_locum_cost(required_grade, "BANK", shift_pattern.get("duration_hours", 8))
+            home_base_doctors = doctors_by_home_base[(site, department, ward)]
+            matching_home_doctors = len([
+                doctor for doctor in home_base_doctors
+                if _doctor_has_required_skills(doctor, required_skills)
+            ])
             shortfalls.append({
                 "site": site,
                 "ward": ward,
@@ -596,9 +653,12 @@ def _build_requirement_shortfalls(
                 "shift_name": shift_pattern.get("name", "Unmapped shift"),
                 "shift_code": shift_pattern.get("code"),
                 "required_grade": required_grade.value if hasattr(required_grade, "value") else str(required_grade),
+                "required_skills": required_skills,
                 "required_doctors": int(requirement.required_doctors or 0),
                 "assigned_doctors": assigned_count,
                 "gap_count": gap_count,
+                "matching_home_doctors": matching_home_doctors,
+                "skill_gap_risk": "GAP_RISK" if required_skills and matching_home_doctors < int(requirement.required_doctors or 0) else "ALIGNED",
                 "approval_status": "TARGET_GAP",
                 "estimated_cost": round(unit_cost * gap_count, 2),
                 "supervising_consultant": requirement.supervising_consultant,
@@ -871,6 +931,15 @@ def _build_recommended_actions(coverage_pressure: list[dict], locum_requests: li
             "impact": "Senior Coverage",
         })
 
+    skill_gap_shortfalls = [item for item in requirement_shortfalls if item.get("skill_gap_risk") == "GAP_RISK"]
+    if skill_gap_shortfalls:
+        skills = ", ".join(skill_gap_shortfalls[0].get("required_skills", [])[:3]) or "specialist skills"
+        actions.append({
+            "title": "Competency-led gaps need targeted cover",
+            "detail": f"{len(skill_gap_shortfalls)} open ward targets need skills such as {skills}.",
+            "impact": "Skills Risk",
+        })
+
     for site_summary in coverage_pressure:
         if site_summary["sickness_events"] > 0:
             actions.append({
@@ -1102,6 +1171,7 @@ def build_operations_workspace_payload(db: Session) -> dict:
             "hospital_sites": sorted({doctor.hospital_site for doctor in doctors}),
             "department_options": sorted({doctor.department for doctor in doctors if doctor.department}),
             "ward_options": sorted({doctor.ward for doctor in doctors if doctor.ward}),
+            "competency_options": sorted({skill for doctor in doctors for skill in _doctor_competencies(doctor)}),
             "doctor_grades": [grade.value for grade in DoctorGrade],
             "availability_event_types": [
                 {"value": event_type.value, "label": EVENT_LABELS.get(event_type, event_type.value.replace("_", " ").title())}
@@ -1137,6 +1207,7 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
         raise HTTPException(status_code=400, detail="A service requirement already exists for this ward, shift, and day pattern")
 
     sanitized_distribution = _sanitize_grade_distribution(payload.grade_distribution)
+    sanitized_skills = _sanitize_skill_list(payload.required_skills)
     total_distribution = sum(sanitized_distribution.values())
     if total_distribution > payload.required_doctors:
         raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
@@ -1148,6 +1219,7 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
         shift_type_id=shift_pattern.id,
         required_doctors=payload.required_doctors,
         grade_distribution=json.dumps(sanitized_distribution),
+        required_skills=json.dumps(sanitized_skills),
         supervising_consultant=payload.supervising_consultant,
     )
     db.add(requirement)
@@ -1173,6 +1245,7 @@ def create_service_requirement(payload: ServiceRequirementCreate, db: Session = 
         "shift_code": shift_pattern.code,
         "required_doctors": requirement.required_doctors,
         "grade_distribution": sanitized_distribution,
+        "required_skills": sanitized_skills,
         "day_of_week": requirement.day_of_week,
         "supervising_consultant": requirement.supervising_consultant,
     }
@@ -1198,6 +1271,7 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
         raise HTTPException(status_code=400, detail="A service requirement already exists for this ward, shift, and day pattern")
 
     sanitized_distribution = _sanitize_grade_distribution(payload.grade_distribution)
+    sanitized_skills = _sanitize_skill_list(payload.required_skills)
     total_distribution = sum(sanitized_distribution.values())
     if total_distribution > payload.required_doctors:
         raise HTTPException(status_code=400, detail="Grade distribution cannot exceed the required doctor count")
@@ -1205,6 +1279,7 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
     requirement.required_doctors = payload.required_doctors
     requirement.day_of_week = normalized_day_template
     requirement.grade_distribution = json.dumps(sanitized_distribution)
+    requirement.required_skills = json.dumps(sanitized_skills)
     requirement.supervising_consultant = payload.supervising_consultant
     db.add(requirement)
 
@@ -1232,6 +1307,7 @@ def update_service_requirement(requirement_id: str, payload: ServiceRequirementU
         "shift_name": shift_name,
         "required_doctors": requirement.required_doctors,
         "grade_distribution": sanitized_distribution,
+        "required_skills": sanitized_skills,
         "day_of_week": requirement.day_of_week,
         "supervising_consultant": requirement.supervising_consultant,
     }
