@@ -176,6 +176,8 @@ async function main() {
 
   if (process.env.DATABASE_URL) {
     await upsertEnvVar(options.serviceId, 'DATABASE_URL', process.env.DATABASE_URL, token)
+    const autoSeedValue = process.env.AUTO_SEED_SAMPLE_DATA ?? 'false'
+    await upsertEnvVar(options.serviceId, 'AUTO_SEED_SAMPLE_DATA', autoSeedValue, token)
   } else {
     console.log('DATABASE_URL not provided. FastAPI will use the SQLite fallback at ./data/medrota.db.')
   }

@@ -30,6 +30,14 @@ If you want FastAPI to boot against Postgres immediately, provide `DATABASE_URL`
 RENDER_API_KEY=your_render_api_key DATABASE_URL=your_postgres_url node scripts/render-cutover.mjs
 ```
 
+When `DATABASE_URL` is provided, the helper now also sets:
+
+```bash
+AUTO_SEED_SAMPLE_DATA=false
+```
+
+unless you explicitly override it in the environment first.
+
 If `DATABASE_URL` is omitted, the FastAPI backend now falls back to SQLite at `./data/medrota.db` and seeds the baseline 1,600-doctor Wythenshawe/Trafford dataset on first boot.
 
 ### Optional persistent data directory
@@ -38,6 +46,16 @@ If you later attach a Render disk, you can point both the Node compatibility lay
 
 ```bash
 RENDER_API_KEY=your_render_api_key DATA_DIR=/var/data node scripts/render-cutover.mjs
+```
+
+### PowerShell shortcut
+
+On Windows / PowerShell you can use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/render-postgres-cutover.ps1 `
+  -RenderApiKey "your_render_api_key" `
+  -DatabaseUrl "postgresql://..."
 ```
 
 ### Live verification

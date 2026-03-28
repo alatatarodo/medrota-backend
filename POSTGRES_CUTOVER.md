@@ -23,6 +23,18 @@ ALLOWED_ORIGINS=https://frontend-cyan-beta-65.vercel.app
 
 `AUTO_SEED_SAMPLE_DATA=false` prevents the app from auto-seeding the demo dataset into a brand-new production database before you migrate existing data.
 
+## Render helper
+
+If you are managing the service from this Windows machine, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/render-postgres-cutover.ps1 `
+  -RenderApiKey "your_render_api_key" `
+  -DatabaseUrl "postgresql://..."
+```
+
+That wrapper calls the existing Render API helper and sets `AUTO_SEED_SAMPLE_DATA=false` for the Postgres cutover by default.
+
 ## Migrate the current SQLite data
 
 Run this from the `backend` directory after you have a Postgres URL:

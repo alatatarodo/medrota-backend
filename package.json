@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "render:cutover": "node scripts/render-cutover.mjs",
+    "render:cutover:postgres": "powershell -ExecutionPolicy Bypass -File scripts/render-postgres-cutover.ps1",
     "verify:live": "node scripts/verify-live.mjs"
   },
   "dependencies": {
