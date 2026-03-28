@@ -10,6 +10,10 @@ from app.api import copilot, doctors, operations, schedule
 Base.metadata.create_all(bind=engine)
 
 
+def _datetime_column_type() -> str:
+    return "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
+
+
 def ensure_schema_updates():
     """Apply lightweight schema updates for environments without migrations."""
     inspector = inspect(engine)
@@ -51,12 +55,12 @@ def ensure_schema_updates():
         if "approved_by" not in availability_columns:
             connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approved_by VARCHAR(100)"))
         if "approved_at" not in availability_columns:
-            connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approved_at DATETIME"))
+            connection.execute(text(f"ALTER TABLE doctor_availability_events ADD COLUMN approved_at {_datetime_column_type()}"))
         if "approval_comment" not in availability_columns:
             connection.execute(text("ALTER TABLE doctor_availability_events ADD COLUMN approval_comment TEXT"))
 
         if "approved_at" not in locum_columns:
-            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approved_at DATETIME"))
+            connection.execute(text(f"ALTER TABLE locum_requests ADD COLUMN approved_at {_datetime_column_type()}"))
         if "approval_comment" not in locum_columns:
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN approval_comment TEXT"))
         if "finance_approval_status" not in locum_columns:
@@ -64,7 +68,7 @@ def ensure_schema_updates():
         if "finance_approved_by" not in locum_columns:
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approved_by VARCHAR(100)"))
         if "finance_approved_at" not in locum_columns:
-            connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approved_at DATETIME"))
+            connection.execute(text(f"ALTER TABLE locum_requests ADD COLUMN finance_approved_at {_datetime_column_type()}"))
         if "finance_approval_comment" not in locum_columns:
             connection.execute(text("ALTER TABLE locum_requests ADD COLUMN finance_approval_comment TEXT"))
 
@@ -76,11 +80,11 @@ def ensure_schema_updates():
         if "publication_status" not in schedule_columns:
             connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN publication_status VARCHAR(20) DEFAULT 'DRAFT'"))
         if "published_at" not in schedule_columns:
-            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN published_at DATETIME"))
+            connection.execute(text(f"ALTER TABLE generated_schedules ADD COLUMN published_at {_datetime_column_type()}"))
         if "published_by" not in schedule_columns:
             connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN published_by VARCHAR(100)"))
         if "archived_at" not in schedule_columns:
-            connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN archived_at DATETIME"))
+            connection.execute(text(f"ALTER TABLE generated_schedules ADD COLUMN archived_at {_datetime_column_type()}"))
         if "archived_by" not in schedule_columns:
             connection.execute(text("ALTER TABLE generated_schedules ADD COLUMN archived_by VARCHAR(100)"))
         connection.execute(
