@@ -153,6 +153,8 @@ def _build_schedule_summary(schedule: GeneratedSchedule, db: Session) -> dict:
         "selected_hospital_sites": notes.get("hospital_sites", []),
         "error": notes.get("error"),
         "progress": progress,
+        # Publication state sits alongside generation status so rota runs can move
+        # through draft, published, and archived workflow without changing history.
         "publication": {
             "status": (schedule.publication_status or "DRAFT").upper(),
             "published_at": schedule.published_at.isoformat() if schedule.published_at else None,
